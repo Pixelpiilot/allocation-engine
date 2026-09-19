@@ -33,6 +33,7 @@ import {
   ComposedChart,
   Area,
   Line,
+  LineChart,
   ReferenceLine,
 } from "recharts";
 
@@ -135,6 +136,29 @@ function matVecMul(mat, vec) {
 
 function dot(a, b) {
   return a.reduce((sum, v, i) => sum + v * b[i], 0);
+}
+
+// Cholesky decomposition of a covariance matrix: returns a lower-triangular
+// L such that L * L^T = Sigma. Used by the Monte Carlo simulation to turn
+// independent standard-normal draws into correlated ones -- this is what
+// lets each instrument's simulated path respect both its own volatility
+// AND its correlation with every other instrument, instead of collapsing
+// the whole portfolio into one blended asset.
+function choleskyDecomposition(Sigma) {
+  const n = Sigma.length;
+  const L = Array.from({ length: n }, () => Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let sum = 0;
+      for (let k = 0; k < j; k++) sum += L[i][k] * L[j][k];
+      if (i === j) {
+        L[i][j] = Math.sqrt(Math.max(Sigma[i][i] - sum, 0));
+      } else {
+        L[i][j] = L[j][j] !== 0 ? (Sigma[i][j] - sum) / L[j][j] : 0;
+      }
+    }
+  }
+  return L;
 }
 
 function softmax(theta) {
@@ -248,13 +272,22 @@ function portfolioMetrics(w, r, Sigma) {
 }
 
 // --- MONTE CARLO SIMULATION ---------------------------------------------
-// Simulates possible future paths of portfolio value using Geometric
-// Brownian Motion (GBM), driven by the portfolio's own annualized
-// return and volatility. GBM has a closed-form step solution, so
-// monthly steps are exact (not an approximation) -- no need for fine
-// daily discretization to stay accurate.
-//   S(t+dt) = S(t) * exp((mu - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)
-// where Z ~ standard normal, drawn via a Box-Muller transform.
+// Multi-asset, correlation-aware simulation. Rather than collapsing the
+// whole portfolio into one blended return/volatility number, every
+// instrument gets its own Geometric Brownian Motion path driven by ITS OWN
+// return and std, and the random shocks across instruments are correlated
+// via a Cholesky decomposition of the covariance matrix -- so two highly
+// correlated holdings tend to move together in each simulated future, the
+// way real markets behave. The portfolio value at each step is just the
+// sum of the simulated instrument values. If periodic rebalancing is
+// enabled, every simulated future also pays the rebalancing cost and
+// resets back toward target weights on schedule, so that drag shows up
+// inside the simulated spread itself rather than as a flat number bolted
+// on afterwards.
+//   S_i(t+dt) = S_i(t) * exp((mu_i - 0.5*sigma_i^2)*dt + sqrt(dt) * (L*Z)_i)
+// where Z is a vector of independent standard normals (Box-Muller) and L
+// is the Cholesky factor of the covariance matrix, so L*Z is a correlated
+// normal vector with the right covariance structure.
 function standardNormalRandom() {
   let u = 0;
   let v = 0;
@@ -272,26 +305,79 @@ function percentileOfSorted(sorted, p) {
   return sorted[lower] * (1 - weight) + sorted[upper] * weight;
 }
 
-function runMonteCarloSimulation({ startValue, annualReturn, annualVol, years, simulationsCount }) {
+function runMonteCarloSimulation({
+  selected,
+  weights,
+  amount,
+  Sigma,
+  years,
+  simulationsCount,
+  rebalanceInfo,
+  sampledPathsCount = 60,
+}) {
+  const n = selected.length;
+  const L = choleskyDecomposition(Sigma);
   const stepsPerYear = 12; // monthly steps
   const steps = Math.max(1, Math.round(years * stepsPerYear));
   const dt = 1 / stepsPerYear;
-  const drift = (annualReturn - 0.5 * annualVol * annualVol) * dt;
-  const diffusion = annualVol * Math.sqrt(dt);
+  const startValues = weights.map((w) => w * amount);
 
-  // valuesByStep[s] holds every simulated portfolio value at step s
-  const valuesByStep = Array.from({ length: steps + 1 }, () => []);
+  const rebalanceEnabled = !!rebalanceInfo?.enabled;
+  const rebalanceStepInterval = rebalanceEnabled
+    ? Math.max(1, Math.round(stepsPerYear / rebalanceInfo.rebalancesPerYear))
+    : null;
+  const costFraction = rebalanceEnabled ? (rebalanceInfo.costPct || 0) / 100 : 0;
+
+  // totalsByStep[s] holds every simulated PORTFOLIO value at step s (for the
+  // percentile band). finalInstrumentValues[i] holds every simulated final
+  // value for instrument i alone (for the per-instrument worst-case stats).
+  // samplePaths keeps the full step-by-step portfolio value for a capped
+  // number of runs, so the "simulated paths" chart stays legible even when
+  // thousands of runs were computed.
+  const totalsByStep = Array.from({ length: steps + 1 }, () => []);
+  const finalInstrumentValues = Array.from({ length: n }, () => []);
+  const sampleCount = Math.max(1, Math.min(sampledPathsCount, simulationsCount));
+  const samplePaths = [];
+
   for (let sim = 0; sim < simulationsCount; sim++) {
-    let value = startValue;
-    valuesByStep[0].push(value);
+    let instrumentValues = [...startValues];
+    let total = amount;
+    const isSampled = sim < sampleCount;
+    const path = isSampled ? [total] : null;
+    totalsByStep[0].push(total);
+
     for (let s = 1; s <= steps; s++) {
-      const z = standardNormalRandom();
-      value = value * Math.exp(drift + diffusion * z);
-      valuesByStep[s].push(value);
+      const zIndep = Array.from({ length: n }, () => standardNormalRandom());
+      const zCorr = matVecMul(L, zIndep); // correlated shocks, variance = Sigma
+      let newTotal = 0;
+      instrumentValues = instrumentValues.map((val, i) => {
+        const mu = selected[i].return;
+        const sigma = selected[i].std;
+        const drift = (mu - 0.5 * sigma * sigma) * dt;
+        const diffusion = zCorr[i] * Math.sqrt(dt);
+        const newVal = val * Math.exp(drift + diffusion);
+        newTotal += newVal;
+        return newVal;
+      });
+      total = newTotal;
+
+      // Periodic rebalance: pay the transaction cost, then reset each
+      // instrument back to its target weight of the post-cost total.
+      if (rebalanceEnabled && s % rebalanceStepInterval === 0 && s !== steps) {
+        const totalAfterCost = total * (1 - costFraction);
+        instrumentValues = weights.map((w) => w * totalAfterCost);
+        total = totalAfterCost;
+      }
+
+      totalsByStep[s].push(total);
+      if (isSampled) path.push(total);
     }
+
+    for (let i = 0; i < n; i++) finalInstrumentValues[i].push(instrumentValues[i]);
+    if (isSampled) samplePaths.push(path);
   }
 
-  const bands = valuesByStep.map((valuesAtStep, s) => {
+  const bands = totalsByStep.map((valuesAtStep, s) => {
     const sorted = [...valuesAtStep].sort((a, b) => a - b);
     return {
       step: s,
@@ -304,13 +390,37 @@ function runMonteCarloSimulation({ startValue, annualReturn, annualVol, years, s
     };
   });
 
-  const finalValues = [...valuesByStep[steps]].sort((a, b) => a - b);
-  const probLoss = finalValues.filter((v) => v < startValue).length / finalValues.length;
+  const finalValues = [...totalsByStep[steps]].sort((a, b) => a - b);
+  const probLoss = finalValues.filter((v) => v < amount).length / finalValues.length;
+
+  // Per-instrument worst case, computed two ways from each instrument's own
+  // std: "simulated" is the empirical 5th percentile across this run's
+  // simulated paths for that instrument; "analytical" is the closed-form
+  // lognormal VaR at 95% confidence, straight from that instrument's return
+  // and std (buy-and-hold, ignoring interim rebalancing resets).
+  const z95 = 1.645; // one-tailed 95% confidence
+  const instrumentStats = selected.map((p, i) => {
+    const sortedFinal = [...finalInstrumentValues[i]].sort((a, b) => a - b);
+    const startVal = startValues[i];
+    const simulatedWorst = percentileOfSorted(sortedFinal, 5);
+    const analyticalWorst =
+      startVal * Math.exp((p.return - 0.5 * p.std * p.std) * years - z95 * p.std * Math.sqrt(years));
+    return {
+      name: p.name,
+      startValue: startVal,
+      median: percentileOfSorted(sortedFinal, 50),
+      simulatedWorst,
+      analyticalWorst,
+      worstPct: (simulatedWorst / startVal - 1) * 100,
+    };
+  });
 
   return {
     bands,
-    finalValues,
+    samplePaths,
     steps,
+    finalValues,
+    instrumentStats,
     stats: {
       median: percentileOfSorted(finalValues, 50),
       p10: percentileOfSorted(finalValues, 10),
@@ -535,6 +645,7 @@ export default function PortfolioAllocationApp() {
     setResult({
       selected,
       weights: w,
+      Sigma,
       ...metrics,
       netReturn,
       expectedValue,
@@ -1112,7 +1223,8 @@ function RunScreen({
 }
 
 function ResultScreen({ result, amount, chartData, onBack }) {
-  const { portReturn, netReturn, portVol, sharpeLike, riskLevel, expectedValue, selected, weights, rebalance } = result;
+  const { portReturn, netReturn, portVol, sharpeLike, riskLevel, expectedValue, selected, weights, rebalance, Sigma } =
+    result;
 
   const animReturn = useCountUp(netReturn * 100);
   const animVol = useCountUp(portVol * 100);
@@ -1131,11 +1243,13 @@ function ResultScreen({ result, amount, chartData, onBack }) {
     setTimeout(() => {
       const horizon = MC_HORIZON_OPTIONS.find((h) => h.value === mcHorizon);
       const output = runMonteCarloSimulation({
-        startValue: amount,
-        annualReturn: netReturn,
-        annualVol: portVol,
+        selected,
+        weights,
+        amount,
+        Sigma,
         years: horizon.years,
         simulationsCount: mcSimCount,
+        rebalanceInfo: rebalance,
       });
       const targetValue = amount * (1 + Number(mcTargetPct) / 100);
       const probTarget = output.finalValues.filter((v) => v >= targetValue).length / output.finalValues.length;
@@ -1143,6 +1257,22 @@ function ResultScreen({ result, amount, chartData, onBack }) {
       setMcRunning(false);
     }, 30);
   }
+
+  // Reshape the capped sample of individual simulated paths into one row per
+  // time step (what recharts needs for a multi-line chart): each row carries
+  // that step's value for every sampled run, keyed sim0, sim1, sim2...
+  const spaghettiData = useMemo(() => {
+    if (!mcOutput) return [];
+    const rows = [];
+    for (let s = 0; s <= mcOutput.steps; s++) {
+      const row = { month: s === 0 ? "Start" : `M${s}` };
+      mcOutput.samplePaths.forEach((path, idx) => {
+        row[`sim${idx}`] = path[s];
+      });
+      rows.push(row);
+    }
+    return rows;
+  }, [mcOutput]);
 
   return (
     <div className="space-y-5">
@@ -1333,8 +1463,9 @@ function ResultScreen({ result, amount, chartData, onBack }) {
           <h2 className="text-sm font-semibold text-slate-200">Monte Carlo simulation</h2>
         </div>
         <p className="text-xs text-slate-500 mb-4">
-          Runs many random future paths for this portfolio (Geometric Brownian Motion, driven by its expected return
-          and volatility) to show a realistic spread of outcomes — not just one projected number.
+          Runs many random future paths, simulating each holding separately with its own return and volatility
+          (Geometric Brownian Motion) while keeping their correlations intact, to show a realistic spread of outcomes
+          — not just one projected number.
         </p>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
@@ -1448,6 +1579,38 @@ function ResultScreen({ result, amount, chartData, onBack }) {
               </ComposedChart>
             </ResponsiveContainer>
 
+            <div>
+              <h3 className="text-xs font-semibold text-slate-300 mb-1">Simulated paths</h3>
+              <p className="text-xs text-slate-500 mb-2">
+                Each faint line is one simulated future, generated from every holding's own return, volatility, and
+                correlation with the others (Cholesky-correlated GBM) — showing {mcOutput.samplePaths.length} of{" "}
+                {mcSimCount.toLocaleString("en-IN")} runs for legibility.
+              </p>
+              <ResponsiveContainer width="100%" height={220}>
+                <LineChart data={spaghettiData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                  <XAxis dataKey="month" tick={{ fontSize: 10, fill: "#94a3b8" }} interval="preserveStartEnd" />
+                  <YAxis
+                    tick={{ fontSize: 10, fill: "#94a3b8" }}
+                    width={56}
+                    tickFormatter={(v) => `₹${Math.round(v / 1000)}k`}
+                  />
+                  <ReferenceLine y={amount} stroke="#94a3b8" strokeDasharray="4 4" />
+                  {mcOutput.samplePaths.map((_, idx) => (
+                    <Line
+                      key={idx}
+                      dataKey={`sim${idx}`}
+                      stroke="#818cf8"
+                      strokeWidth={1}
+                      dot={false}
+                      isAnimationActive={false}
+                      strokeOpacity={0.22}
+                    />
+                  ))}
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
               <div className="rounded-lg border border-slate-800 px-3 py-2.5">
                 <p className="text-xs text-slate-500">Median outcome</p>
@@ -1484,10 +1647,44 @@ function ResultScreen({ result, amount, chartData, onBack }) {
               </p>
             </div>
 
+            <div>
+              <h3 className="text-xs font-semibold text-slate-300 mb-1">Per-instrument worst case</h3>
+              <p className="text-xs text-slate-500 mb-2">
+                For each holding, using its own volatility: the simulated 5th-percentile outcome from the paths above,
+                and an analytical worst case (95% confidence, lognormal) computed directly from that instrument's own
+                return and std.
+              </p>
+              <div className="space-y-2">
+                {mcOutput.instrumentStats.map((s, i) => (
+                  <div
+                    key={s.name}
+                    className="flex items-center justify-between gap-3 text-sm rounded-lg border border-slate-800 px-3 py-2.5"
+                  >
+                    <span className="flex items-center gap-2 min-w-0">
+                      <span
+                        className="h-2 w-2 rounded-full shrink-0"
+                        style={{ backgroundColor: SERIES_COLORS[i % SERIES_COLORS.length] }}
+                      />
+                      <span className="truncate text-slate-200">{s.name}</span>
+                    </span>
+                    <div className="text-right font-mono text-xs shrink-0">
+                      <div className="text-rose-400">
+                        ₹{Math.round(s.simulatedWorst).toLocaleString("en-IN")} ({s.worstPct.toFixed(1)}%)
+                      </div>
+                      <div className="text-slate-600">
+                        analytical: ₹{Math.round(s.analyticalWorst).toLocaleString("en-IN")}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
             <p className="text-xs text-slate-600">
-              Based on {mcSimCount.toLocaleString("en-IN")} simulated paths using this portfolio's net return (
-              {(netReturn * 100).toFixed(2)}%) and volatility ({(portVol * 100).toFixed(2)}%). This is a probabilistic
-              projection, not a guarantee — actual results can fall outside the shown band.
+              Based on {mcSimCount.toLocaleString("en-IN")} simulated paths, each built by simulating every holding
+              separately from its own return and volatility with their mutual correlations preserved (not just the
+              portfolio's blended return/volatility). This is a probabilistic projection, not a guarantee — actual
+              results can fall outside the shown band.
             </p>
           </div>
         )}
