@@ -37,13 +37,6 @@ import {
   ReferenceLine,
 } from "recharts";
 
-const PERIOD_OPTIONS = [
-  { value: "6m", label: "6 Months" },
-  { value: "1y", label: "1 Year" },
-  { value: "2y", label: "2 Years" },
-  { value: "5y", label: "5 Years" },
-];
-
 const REBALANCE_FREQUENCY_OPTIONS = [
   { value: "quarterly", label: "Quarterly", perYear: 4 },
   { value: "half-yearly", label: "Half-yearly", perYear: 2 },
@@ -57,40 +50,304 @@ const MC_HORIZON_OPTIONS = [
   { value: "5", label: "5 Years", years: 5 },
 ];
 
-const MC_SIM_COUNT_OPTIONS = [200, 500, 1000];
+const MC_SIM_COUNT_OPTIONS = [200, 500, 1000, 5000, 50000, 100000, 1000000];
 
-// Signature palette for allocation series — cycles across up to 5 holdings.
-const SERIES_COLORS = ["#2dd4bf", "#818cf8", "#fbbf24", "#fb7185", "#34d399"];
+// Percentiles reported in the Monte Carlo percentile table.
+const MC_PERCENTILES = [5, 10, 25, 50, 75, 90, 95];
 
-function hashString(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) - hash + str.charCodeAt(i);
-    hash |= 0;
+const MC_MODEL_OPTIONS = [
+  { value: "dynamic", label: "Dynamic (real-market)" },
+  { value: "constant", label: "Constant (simple)" },
+];
+
+// --- DYNAMIC MARKET MODEL (regimes + stochastic volatility + stress correlation)
+// Real markets do not keep one return, one std and one correlation forever.
+// This model lets all three move month by month:
+//   1. REGIMES -- a Markov chain switches the whole market between Calm,
+//      Normal and Stress. Each regime has its own volatility multiplier.
+//      The chain is built from two intuitive inputs: how much of the time
+//      the market spends in Stress, and how long a Stress spell lasts.
+//   2. MARKET VOLATILITY -- on top of the regime, market volatility drifts
+//      continuously (mean-reverting AR(1) on log-volatility), so std keeps
+//      moving above AND below the value you entered.
+//   3. PER-HOLDING VOLATILITY -- every holding also has its own smaller
+//      volatility wobble, so holdings do not all scale in lock-step.
+//   4. RETURN LINKED TO STD -- when a holding's volatility is above its
+//      long-run level, its expected return is shifted (direction and
+//      strength are user-selectable: real-market = return falls, risk
+//      premium = return rises, or no link).
+//   5. LEVERAGE FEEDBACK -- a negative market shock makes next month's
+//      market volatility more likely to rise.
+//   6. STRESS CORRELATION -- in Stress, positive correlations move toward 1
+//      (diversification weakens when you need it most); negative
+//      correlations (hedges) are left alone.
+// Everything is normalised so that, averaged over the long run, the std
+// you entered is still the std (E[k^2] = 1) and the return you entered is
+// still the return (the adjustment averages to zero). The correlation you
+// enter is the correlation in Calm/Normal conditions.
+const REGIME_LABELS = ["Calm", "Normal", "Stress"];
+const STRESS_INDEX = 2;
+
+const VOL_PERSISTENCE = 0.85; // monthly AR(1) persistence of log-volatility
+const RISK_PREMIUM_DAMPING = 0.3; // the empirical risk-premium effect is much weaker than the leverage effect
+
+const RETURN_LINK_OPTIONS = [
+  { value: "real", label: "Real market — return falls when volatility rises" },
+  { value: "none", label: "No link — return independent of volatility" },
+  { value: "premium", label: "Risk premium — return rises with volatility (weaker)" },
+];
+
+// Market "severity" presets. These are reasonable stylised defaults, not
+// calibrated to one specific market -- every value can be edited under
+// "Advanced market settings".
+const MARKET_PRESETS = {
+  mild: {
+    label: "Mild",
+    calmMult: 0.8,
+    stressMult: 1.5,
+    stressShare: 0.08,
+    stressMonths: 4,
+    volOfVol: 0.15,
+    idioVolOfVol: 0.08,
+    returnLink: 0.8,
+    leverageCorr: -0.4,
+    stressCorrBoost: 0.15,
+  },
+  realistic: {
+    label: "Realistic",
+    calmMult: 0.7,
+    stressMult: 1.9,
+    stressShare: 0.12,
+    stressMonths: 5.5,
+    volOfVol: 0.2,
+    idioVolOfVol: 0.1,
+    returnLink: 1.2,
+    leverageCorr: -0.5,
+    stressCorrBoost: 0.3,
+  },
+  severe: {
+    label: "Severe",
+    calmMult: 0.65,
+    stressMult: 2.4,
+    stressShare: 0.18,
+    stressMonths: 8,
+    volOfVol: 0.28,
+    idioVolOfVol: 0.12,
+    returnLink: 1.6,
+    leverageCorr: -0.6,
+    stressCorrBoost: 0.45,
+  },
+};
+
+const MARKET_PARAM_FIELDS = [
+  { key: "calmMult", label: "Calm volatility (× your std)", min: 0.4, max: 1, step: 0.05, scale: 1 },
+  { key: "stressMult", label: "Stress volatility (× your std)", min: 1.1, max: 4, step: 0.1, scale: 1 },
+  { key: "stressShare", label: "Time in Stress (%)", min: 2, max: 35, step: 1, scale: 100 },
+  { key: "stressMonths", label: "Avg Stress length (months)", min: 2, max: 24, step: 0.5, scale: 1 },
+  { key: "volOfVol", label: "Market vol-of-vol", min: 0, max: 0.6, step: 0.01, scale: 1 },
+  { key: "idioVolOfVol", label: "Per-holding vol-of-vol", min: 0, max: 0.4, step: 0.01, scale: 1 },
+  { key: "returnLink", label: "Return–vol link strength", min: 0, max: 3, step: 0.1, scale: 1 },
+  { key: "leverageCorr", label: "Leverage correlation", min: -0.95, max: 0, step: 0.05, scale: 1 },
+  { key: "stressCorrBoost", label: "Stress correlation boost", min: 0, max: 0.8, step: 0.05, scale: 1 },
+];
+
+function paramsToText(params) {
+  const out = {};
+  MARKET_PARAM_FIELDS.forEach((f) => {
+    out[f.key] = String(Number((params[f.key] * f.scale).toFixed(3)));
+  });
+  return out;
+}
+
+// Turns the (string) settings from the form into clamped numbers, and folds
+// the chosen return-vs-volatility direction into one signed coefficient
+// (negative = return falls when volatility rises).
+function sanitizeMarketParams(text, linkMode) {
+  const out = {};
+  MARKET_PARAM_FIELDS.forEach((f) => {
+    let v = Number(text[f.key]);
+    if (text[f.key] === "" || text[f.key] === undefined || Number.isNaN(v)) {
+      v = MARKET_PRESETS.realistic[f.key] * f.scale;
+    }
+    out[f.key] = Math.min(f.max, Math.max(f.min, v)) / f.scale;
+  });
+  out.returnLinkSigned =
+    linkMode === "real" ? -out.returnLink : linkMode === "premium" ? out.returnLink * RISK_PREMIUM_DAMPING : 0;
+  return out;
+}
+
+function sampleIndex(probs) {
+  let r = Math.random();
+  for (let i = 0; i < probs.length; i++) {
+    r -= probs[i];
+    if (r <= 0) return i;
   }
-  return Math.abs(hash);
+  return probs.length - 1;
 }
 
-// --- DATA LAYER -----------------------------------------------------
-// These two functions are the ONLY places that need to change to plug in
-// real market data. Right now they simulate values deterministically from
-// the ticker symbol so the whole flow is demoable without a backend.
-// In production, replace the body with a fetch() call to a backend
-// endpoint (e.g. a FastAPI service wrapping yfinance) -- browsers cannot
-// call Yahoo Finance directly because of CORS.
-function fetchTickerStats(ticker, period) {
-  const h = hashString(ticker + period);
-  const periodFactor = { "6m": 0.9, "1y": 1.0, "2y": 1.05, "5y": 1.1 }[period] ?? 1.0;
-  const ret = (0.05 + (h % 1200) / 10000) * periodFactor;
-  const std = (0.03 + (h % 2200) / 10000) * periodFactor;
-  return { return: Number(ret.toFixed(4)), std: Number(std.toFixed(4)) };
+function stationaryDistribution(P) {
+  let pi = P.map(() => 1 / P.length);
+  for (let it = 0; it < 300; it++) {
+    pi = P.map((_, j) => pi.reduce((sum, p, i) => sum + p * P[i][j], 0));
+  }
+  return pi;
 }
 
-function fetchCorrelation(tickerA, tickerB, period) {
-  if (tickerA === tickerB) return 1;
-  const pairKey = [tickerA, tickerB].sort().join("|") + period;
-  const h = hashString(pairKey);
-  return Number((((h % 1400) / 1000) - 0.4).toFixed(3));
+// Monthly regime transition matrix (Calm, Normal, Stress) built from the
+// long-run share of time in Stress and the average length of a Stress spell.
+// Stress is entered mostly from Normal (rarely straight from Calm) and left
+// mostly toward Normal; the Normal-to-Stress probability is solved so the
+// chain's long-run Stress share hits the requested value.
+function buildRegimeTransitions(stressShare, stressMonths) {
+  const exitStress = 1 / stressMonths;
+  const stressRow = [0.15 * exitStress, 0.85 * exitStress, 1 - exitStress];
+  const make = (aN) => {
+    const aC = 0.2 * aN;
+    return [
+      [1 - 0.05 - aC, 0.05, aC],
+      [0.04, 1 - 0.04 - aN, aN],
+      stressRow,
+    ];
+  };
+  let lo = 0;
+  let hi = 0.3;
+  for (let it = 0; it < 40; it++) {
+    const mid = (lo + hi) / 2;
+    if (stationaryDistribution(make(mid))[STRESS_INDEX] < stressShare) lo = mid;
+    else hi = mid;
+  }
+  return make((lo + hi) / 2);
+}
+
+// Long-run regime probabilities plus the constants that keep the user's
+// inputs as long-run averages.
+function buildDynamicParams(mp) {
+  const transitions = buildRegimeTransitions(mp.stressShare, mp.stressMonths);
+  const pi = stationaryDistribution(transitions);
+  const raw = [mp.calmMult, 1, mp.stressMult];
+  const meanSq = pi.reduce((sum, p, i) => sum + p * raw[i] ** 2, 0);
+  const mult = raw.map((m) => m / Math.sqrt(meanSq)); // E[mult^2] = 1
+  const meanMult = pi.reduce((sum, p, i) => sum + p * mult[i], 0);
+  // v = exp(y - s^2) with y ~ N(0, s^2)  =>  E[v^2] = 1 and E[v] = exp(-s^2/2)
+  const meanMarketV = Math.exp(-0.5 * mp.volOfVol ** 2);
+  const meanIdioV = Math.exp(-0.5 * mp.idioVolOfVol ** 2);
+  return { transitions, pi, mult, kBar: meanMult * meanMarketV * meanIdioV };
+}
+
+// Because a holding's return shift moves up and down with volatility, the
+// growth it compounds is random, and by Jensen's inequality a random growth
+// rate lifts the AVERAGE outcome slightly above what you entered. To keep
+// your return as the true long-run average, a short pilot simulation of just
+// the volatility process measures that lift for each holding at each month,
+// and the simulator subtracts exactly that (a small deterministic amount per
+// month) from the drift.
+function driftConvexityCorrections({ dyn, mp, baseVols, steps, dt, pilotPaths = 3000 }) {
+  const n = baseVols.length;
+  const link = mp.returnLinkSigned;
+  const marketEta = mp.volOfVol * Math.sqrt(1 - VOL_PERSISTENCE ** 2);
+  const idioEta = mp.idioVolOfVol * Math.sqrt(1 - VOL_PERSISTENCE ** 2);
+  const sums = Array.from({ length: steps }, () => Array(n).fill(0));
+  for (let path = 0; path < pilotPaths; path++) {
+    let regime = sampleIndex(dyn.pi);
+    let marketVol = mp.volOfVol * standardNormalRandom();
+    const idio = Array.from({ length: n }, () => mp.idioVolOfVol * standardNormalRandom());
+    const accumulated = Array(n).fill(0);
+    for (let t = 0; t < steps; t++) {
+      const marketK = dyn.mult[regime] * Math.exp(marketVol - mp.volOfVol ** 2);
+      for (let i = 0; i < n; i++) {
+        const k = marketK * Math.exp(idio[i] - mp.idioVolOfVol ** 2);
+        accumulated[i] += link * (k - dyn.kBar) * baseVols[i] * dt;
+        sums[t][i] += Math.exp(accumulated[i]);
+      }
+      const volShock = mp.leverageCorr * standardNormalRandom() + Math.sqrt(1 - mp.leverageCorr ** 2) * standardNormalRandom();
+      marketVol = VOL_PERSISTENCE * marketVol + marketEta * volShock;
+      for (let i = 0; i < n; i++) idio[i] = VOL_PERSISTENCE * idio[i] + idioEta * standardNormalRandom();
+      regime = sampleIndex(dyn.transitions[regime]);
+    }
+  }
+  const corrections = Array.from({ length: steps }, () => Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    let prev = 0;
+    for (let t = 0; t < steps; t++) {
+      const cum = Math.log(sums[t][i] / pilotPaths);
+      corrections[t][i] = cum - prev;
+      prev = cum;
+    }
+  }
+  return corrections;
+}
+
+// A symmetric matrix is usable as a covariance/correlation matrix only if it
+// is positive semi-definite; tested with a Cholesky attempt.
+function isPositiveSemiDefinite(M) {
+  const n = M.length;
+  const L = Array.from({ length: n }, () => Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let sum = 0;
+      for (let k = 0; k < j; k++) sum += L[i][k] * L[j][k];
+      if (i === j) {
+        const d = M[i][i] + 1e-9 - sum;
+        if (d <= 0) return false;
+        L[i][i] = Math.sqrt(d);
+      } else {
+        L[i][j] = (M[i][j] - sum) / L[j][j];
+      }
+    }
+  }
+  return true;
+}
+
+// Stress-regime correlation matrix: every positive correlation moves part of
+// the way toward 1 (rho + boost*(1 - rho)); zero/negative correlations
+// (hedges) are left unchanged. If the result is not a valid correlation
+// matrix it is blended back toward the original until it is.
+function stressCorrelationMatrix(C, boost) {
+  const n = C.length;
+  const candidate = C.map((row, i) =>
+    row.map((c, j) => (i === j ? 1 : c > 0 ? c + boost * (1 - c) : c))
+  );
+  for (const t of [1, 0.75, 0.5, 0.25]) {
+    const mix = C.map((row, i) => row.map((c, j) => (1 - t) * c + t * candidate[i][j]));
+    if (isPositiveSemiDefinite(mix)) return mix;
+  }
+  return C.map((row) => [...row]);
+}
+
+// Monochrome palette for allocation series — alternating light/dark greys so neighbours stay distinct (up to 5 holdings).
+const SERIES_COLORS = ["#fafafa", "#a3a3a3", "#d4d4d4", "#737373", "#525252"];
+
+// One clearly different colour per simulated-path line. Hue steps by the
+// golden angle (so neighbouring lines never look alike), while lightness and
+// saturation cycle through a few levels so that even lines with a similar hue
+// stay apart. Checked: every one of the 60 colours is visibly different from
+// all the others.
+const PATH_LIGHTNESS = [46, 58, 70, 82];
+const PATH_SATURATION = [95, 70];
+const PATH_COLORS = Array.from(
+  { length: 60 },
+  (_, i) =>
+    `hsl(${Math.round((i * 137.508) % 360)}, ${PATH_SATURATION[(i >> 2) % PATH_SATURATION.length]}%, ${
+      PATH_LIGHTNESS[i % PATH_LIGHTNESS.length]
+    }%)`
+);
+
+// --- FORMAT HELPERS -----------------------------------------------------
+function fmtINR(v) {
+  return `₹${Math.round(v).toLocaleString("en-IN")}`;
+}
+
+// Compact Indian-style labels for chart axes: 12k, 1.5L, 2.3Cr.
+function fmtINRCompact(v) {
+  const abs = Math.abs(v);
+  if (abs >= 1e7) return `₹${(v / 1e7).toFixed(2)}Cr`;
+  if (abs >= 1e5) return `₹${(v / 1e5).toFixed(1)}L`;
+  if (abs >= 1e3) return `₹${Math.round(v / 1e3)}k`;
+  return `₹${Math.round(v)}`;
+}
+
+function fmtPct(v, digits = 1) {
+  return `${(v * 100).toFixed(digits)}%`;
 }
 
 // --- MATH LAYER -------------------------------------------------------
@@ -101,16 +358,17 @@ function pairKeyById(idA, idB) {
   return [idA, idB].sort((a, b) => a - b).join(":");
 }
 
-// Correlation for a pair of products: a manual override always wins;
-// otherwise falls back to the ticker-based calculation (using whichever
-// product's period is set -- same period the two products' own
-// return/std were calculated over).
+// Default correlation between two different products until the user sets
+// one in the correlation matrix (0 = uncorrelated).
+const DEFAULT_CORRELATION = 0;
+
+// Correlation for a pair of products: the value the user entered in the
+// matrix if there is one, otherwise DEFAULT_CORRELATION.
 function getCorrelation(pA, pB, overrides = {}) {
   if (pA.id === pB.id) return 1;
   const key = pairKeyById(pA.id, pB.id);
   if (overrides[key] !== undefined) return overrides[key];
-  const period = pA.period || pB.period || "1y";
-  return fetchCorrelation(pA.ticker, pB.ticker, period);
+  return DEFAULT_CORRELATION;
 }
 
 function buildCovMatrix(selected, overrides = {}) {
@@ -285,15 +543,37 @@ function portfolioMetrics(w, r, Sigma) {
 // inside the simulated spread itself rather than as a flat number bolted
 // on afterwards.
 //   S_i(t+dt) = S_i(t) * exp((mu_i - 0.5*sigma_i^2)*dt + sqrt(dt) * (L*Z)_i)
+// (the "Constant" model). The "Dynamic" model multiplies sigma by a
+// time-varying k and shifts mu by an opposite-moving adjustment -- see
+// DYNAMIC MARKET MODEL above.
 // where Z is a vector of independent standard normals (Box-Muller) and L
 // is the Cholesky factor of the covariance matrix, so L*Z is a correlated
 // normal vector with the right covariance structure.
+//
+// Standard risk output computed from the simulated distribution:
+//   - Percentile fan (5/25/50/75/95) of portfolio value over time
+//   - Distribution (histogram) of final portfolio values
+//   - Mean, median, std of final value; percentile table
+//   - Probability of loss
+//   - Value at Risk (VaR 95%) and Conditional VaR / Expected Shortfall (CVaR 95%)
+//   - Maximum drawdown per path (median and 5th-percentile worst)
+//   - Annualized return distribution
+// Box-Muller produces two independent normals per pair of uniforms; the
+// second one is kept for the next call, which halves the cost of the very
+// large runs.
+let spareNormal = null;
 function standardNormalRandom() {
+  if (spareNormal !== null) {
+    const value = spareNormal;
+    spareNormal = null;
+    return value;
+  }
   let u = 0;
-  let v = 0;
   while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  const v = Math.random();
+  const magnitude = Math.sqrt(-2 * Math.log(u));
+  spareNormal = magnitude * Math.sin(2 * Math.PI * v);
+  return magnitude * Math.cos(2 * Math.PI * v);
 }
 
 function percentileOfSorted(sorted, p) {
@@ -305,7 +585,243 @@ function percentileOfSorted(sorted, p) {
   return sorted[lower] * (1 - weight) + sorted[upper] * weight;
 }
 
-function runMonteCarloSimulation({
+// --- SCENARIO ENGINE ------------------------------------------------------
+// Simulates possible futures for every holding and turns them into the
+// month-by-month growth factor of each holding. Futures are produced in
+// chunks and folded straight into running results, so even a million runs
+// never has to be held in memory at once.
+// The market "shock" that drives volatility feedback is measured on an
+// equal-weight basket, so the simulated market does not depend on which
+// allocation is being tested.
+function prepareScenarioEngine({ selected, Sigma, years, model = "dynamic", marketParams = null }) {
+  const n = selected.length;
+  const L = choleskyDecomposition(Sigma);
+  const stepsPerYear = 12; // monthly steps
+  const steps = Math.max(1, Math.round(years * stepsPerYear));
+  const dt = 1 / stepsPerYear;
+  const sqrtDt = Math.sqrt(dt);
+
+  const dynamic = model === "dynamic";
+  const mp = {
+    ...MARKET_PRESETS.realistic,
+    returnLinkSigned: -MARKET_PRESETS.realistic.returnLink,
+    ...(marketParams || {}),
+  };
+  const dyn = dynamic ? buildDynamicParams(mp) : null;
+  const baseVols = selected.map((p) => p.std);
+  const mus = selected.map((p) => p.return);
+
+  // Calm/Normal correlation (as implied by Sigma) and the Stress version.
+  const Cbase = Sigma.map((row, i) => row.map((v, j) => (i === j ? 1 : v / (baseVols[i] * baseVols[j]))));
+  const Cstress = dynamic ? stressCorrelationMatrix(Cbase, mp.stressCorrBoost) : Cbase;
+  const Lstress = dynamic
+    ? choleskyDecomposition(Cstress.map((row, i) => row.map((c, j) => c * baseVols[i] * baseVols[j])))
+    : L;
+  const proxyWeights = Array(n).fill(1 / n);
+  const shockSd = (C) => {
+    let v = 0;
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) v += proxyWeights[i] * proxyWeights[j] * C[i][j];
+    return Math.sqrt(Math.max(v, 1e-12));
+  };
+  const marketShockSdBase = shockSd(Cbase);
+  const marketShockSdStress = shockSd(Cstress);
+
+  const volSq = mp.volOfVol ** 2;
+  const idioSq = mp.idioVolOfVol ** 2;
+  const marketEta = mp.volOfVol * Math.sqrt(1 - VOL_PERSISTENCE ** 2);
+  const idioEta = mp.idioVolOfVol * Math.sqrt(1 - VOL_PERSISTENCE ** 2);
+  const leverageRest = Math.sqrt(1 - mp.leverageCorr ** 2);
+  const driftCorr =
+    dynamic && mp.returnLinkSigned !== 0 ? driftConvexityCorrections({ dyn, mp, baseVols, steps, dt }) : null;
+  const regimeCounts = Array(REGIME_LABELS.length).fill(0);
+
+  // Work buffers reused for every month of every future (no per-step allocation).
+  const zIndep = new Float64Array(n);
+  const zCorr = new Float64Array(n);
+  const ks = new Float64Array(n); // std multiplier of each holding this month
+  const adjs = new Float64Array(n); // return shift of each holding this month
+  const idio = new Float64Array(n); // each holding's own volatility state
+
+  function generate(count, trackCount = 0) {
+    const growth = new Float64Array(count * steps * n);
+    const trackRaw = [];
+    let idx = 0;
+
+    for (let sim = 0; sim < count; sim++) {
+      // Each simulated future starts from a random (long-run typical) market
+      // regime and volatility level.
+      let regime = dynamic ? sampleIndex(dyn.pi) : 0;
+      let marketVol = dynamic ? mp.volOfVol * standardNormalRandom() : 0;
+      for (let i = 0; i < n; i++) idio[i] = dynamic ? mp.idioVolOfVol * standardNormalRandom() : 0;
+      const trk = dynamic && sim < trackCount ? [] : null;
+
+      for (let s = 1; s <= steps; s++) {
+        for (let i = 0; i < n; i++) zIndep[i] = standardNormalRandom();
+        const inStress = dynamic && regime === STRESS_INDEX;
+        // Correlated shocks with variance = Sigma (lower-triangular Cholesky
+        // factor); in Stress the (higher) stress correlations are used.
+        const Lm = inStress ? Lstress : L;
+        for (let i = 0; i < n; i++) {
+          const row = Lm[i];
+          let acc = 0;
+          for (let j = 0; j <= i; j++) acc += row[j] * zIndep[j];
+          zCorr[i] = acc;
+        }
+
+        // This month's market conditions. ks[i] scales holding i's std
+        // (k > 1 = more volatile than the std you entered, k < 1 = calmer);
+        // adjs[i] shifts its return by the chosen link to volatility, in
+        // units of its own std. Constant model: k = 1, adj = 0.
+        if (dynamic) {
+          const marketK = dyn.mult[regime] * Math.exp(marketVol - volSq);
+          for (let i = 0; i < n; i++) {
+            const k = marketK * Math.exp(idio[i] - idioSq);
+            ks[i] = k;
+            adjs[i] = mp.returnLinkSigned * (k - dyn.kBar);
+          }
+          regimeCounts[regime] += 1;
+        } else {
+          for (let i = 0; i < n; i++) {
+            ks[i] = 1;
+            adjs[i] = 0;
+          }
+        }
+
+        const corrRow = driftCorr ? driftCorr[s - 1] : null;
+        for (let i = 0; i < n; i++) {
+          const sigmaEff = baseVols[i] * ks[i];
+          const mu = mus[i] + adjs[i] * baseVols[i];
+          const drift = (mu - 0.5 * sigmaEff * sigmaEff) * dt - (corrRow ? corrRow[i] : 0);
+          growth[idx++] = Math.exp(drift + zCorr[i] * ks[i] * sqrtDt);
+        }
+        if (trk) trk.push({ regime, ks: Array.from(ks), adjs: Array.from(adjs) });
+
+        // Evolve the market state for next month: market volatility reacts to
+        // this month's market shock (leverage effect), each holding's own
+        // volatility takes a small independent step, then the regime may switch.
+        if (dynamic) {
+          let shockSum = 0;
+          for (let i = 0; i < n; i++) shockSum += (proxyWeights[i] * zCorr[i]) / baseVols[i];
+          const marketShock = shockSum / (inStress ? marketShockSdStress : marketShockSdBase); // ~ N(0, 1)
+          marketVol =
+            VOL_PERSISTENCE * marketVol +
+            marketEta * (mp.leverageCorr * marketShock + leverageRest * standardNormalRandom());
+          for (let i = 0; i < n; i++) idio[i] = VOL_PERSISTENCE * idio[i] + idioEta * standardNormalRandom();
+          regime = sampleIndex(dyn.transitions[regime]);
+        }
+      }
+      if (trk) trackRaw.push(trk);
+    }
+    return { n, steps, count, growth, trackRaw };
+  }
+
+  return { n, steps, dynamic, model, regimeCounts, Cbase, Cstress, baseVols, generate };
+}
+
+// Month-by-month effective portfolio std and expected return for a few
+// tracked futures (for the "market conditions" chart).
+function buildConditionTracks(scen, weights, selected) {
+  const { n, baseVols, Cbase, Cstress, trackRaw } = scen;
+  return trackRaw.map((trk) =>
+    trk.map((t, idx) => {
+      const C = t.regime === STRESS_INDEX ? Cstress : Cbase;
+      let effVar = 0;
+      let effRet = 0;
+      for (let i = 0; i < n; i++) {
+        effRet += weights[i] * (selected[i].return + t.adjs[i] * baseVols[i]);
+        for (let j = 0; j < n; j++) {
+          effVar += weights[i] * weights[j] * baseVols[i] * t.ks[i] * baseVols[j] * t.ks[j] * C[i][j];
+        }
+      }
+      return { month: idx + 1, std: Math.sqrt(Math.max(effVar, 0)), ret: effRet, regime: REGIME_LABELS[t.regime] };
+    })
+  );
+}
+
+// Running results for a whole simulation. Everything is kept in compact
+// typed arrays: one number per run for final values, drawdowns and each
+// holding; the month-by-month fan chart uses the first BAND_SAMPLE runs
+// (plenty for stable percentile bands); a few full paths are kept to draw.
+const BAND_SAMPLE = 20000;
+
+function createOutcomeCollector({ n, steps, count, sampledPaths = 60 }) {
+  const bandCount = Math.min(count, BAND_SAMPLE);
+  return {
+    n,
+    steps,
+    count,
+    filled: 0,
+    bandCount,
+    finals: new Float64Array(count),
+    maxDD: new Float64Array(count),
+    hold: Array.from({ length: n }, () => new Float64Array(count)),
+    bandValues: Array.from({ length: steps + 1 }, () => new Float64Array(bandCount)),
+    samplePaths: [],
+    sampleLimit: Math.max(1, Math.min(sampledPaths, count)),
+  };
+}
+
+// Runs one allocation through a chunk of simulated futures (rebalancing costs
+// included) and stores the results in the collector.
+function evaluateChunkInto(col, weights, scen, amount, rebalanceInfo) {
+  const { n, steps } = col;
+  const { growth, count } = scen;
+  const rebalanceEnabled = !!rebalanceInfo?.enabled;
+  const interval = rebalanceEnabled ? Math.max(1, Math.round(12 / rebalanceInfo.rebalancesPerYear)) : 0;
+  const costFraction = rebalanceEnabled ? (rebalanceInfo.costPct || 0) / 100 : 0;
+  const vals = new Float64Array(n); // portfolio holdings (rebalanced)
+  const holds = new Float64Array(n); // same assets, never rebalanced
+
+  for (let sim = 0; sim < count; sim++) {
+    const g = col.filled + sim;
+    for (let i = 0; i < n; i++) {
+      vals[i] = weights[i] * amount;
+      holds[i] = vals[i];
+    }
+    let total = amount;
+    let peak = amount;
+    let maxDD = 0;
+    const isSampled = g < col.sampleLimit;
+    const path = isSampled ? [total] : null;
+    const inBand = g < col.bandCount;
+    if (inBand) col.bandValues[0][g] = total;
+    const base = sim * steps * n;
+
+    for (let s = 1; s <= steps; s++) {
+      total = 0;
+      const off = base + (s - 1) * n;
+      for (let i = 0; i < n; i++) {
+        const growthFactor = growth[off + i];
+        holds[i] *= growthFactor;
+        vals[i] *= growthFactor;
+        total += vals[i];
+      }
+      // Periodic rebalance: pay the transaction cost, then reset each
+      // instrument back to its target weight of the post-cost total.
+      if (rebalanceEnabled && s % interval === 0 && s !== steps) {
+        total *= 1 - costFraction;
+        for (let i = 0; i < n; i++) vals[i] = weights[i] * total;
+      }
+      // Running peak-to-trough drawdown for this path.
+      if (total > peak) peak = total;
+      const dd = total / peak - 1;
+      if (dd < maxDD) maxDD = dd;
+      if (inBand) col.bandValues[s][g] = total;
+      if (isSampled) path.push(total);
+    }
+
+    col.finals[g] = total;
+    col.maxDD[g] = maxDD;
+    for (let i = 0; i < n; i++) col.hold[i][g] = holds[i];
+    if (isSampled) col.samplePaths.push(path);
+  }
+  col.filled += count;
+}
+
+// A Monte Carlo run that can be advanced in small time slices, so the page
+// stays responsive (and can show progress) even for hundreds of thousands of
+// runs. runChunk(ms) works for about that long; finish() builds the results.
+function createMonteCarloJob({
   selected,
   weights,
   amount,
@@ -313,123 +829,185 @@ function runMonteCarloSimulation({
   years,
   simulationsCount,
   rebalanceInfo,
+  model = "dynamic",
+  marketParams = null,
   sampledPathsCount = 60,
 }) {
-  const n = selected.length;
-  const L = choleskyDecomposition(Sigma);
-  const stepsPerYear = 12; // monthly steps
-  const steps = Math.max(1, Math.round(years * stepsPerYear));
-  const dt = 1 / stepsPerYear;
-  const startValues = weights.map((w) => w * amount);
+  const engine = prepareScenarioEngine({ selected, Sigma, years, model, marketParams });
+  const { n, steps, dynamic } = engine;
+  const collector = createOutcomeCollector({ n, steps, count: simulationsCount, sampledPaths: sampledPathsCount });
+  const chunkSize = Math.max(100, Math.min(5000, Math.floor(60000 / (steps * n))));
+  let done = 0;
+  let trackRaw = [];
 
-  const rebalanceEnabled = !!rebalanceInfo?.enabled;
-  const rebalanceStepInterval = rebalanceEnabled
-    ? Math.max(1, Math.round(stepsPerYear / rebalanceInfo.rebalancesPerYear))
-    : null;
-  const costFraction = rebalanceEnabled ? (rebalanceInfo.costPct || 0) / 100 : 0;
-
-  // totalsByStep[s] holds every simulated PORTFOLIO value at step s (for the
-  // percentile band). finalInstrumentValues[i] holds every simulated final
-  // value for instrument i alone (for the per-instrument worst-case stats).
-  // samplePaths keeps the full step-by-step portfolio value for a capped
-  // number of runs, so the "simulated paths" chart stays legible even when
-  // thousands of runs were computed.
-  const totalsByStep = Array.from({ length: steps + 1 }, () => []);
-  const finalInstrumentValues = Array.from({ length: n }, () => []);
-  const sampleCount = Math.max(1, Math.min(sampledPathsCount, simulationsCount));
-  const samplePaths = [];
-
-  for (let sim = 0; sim < simulationsCount; sim++) {
-    let instrumentValues = [...startValues];
-    let total = amount;
-    const isSampled = sim < sampleCount;
-    const path = isSampled ? [total] : null;
-    totalsByStep[0].push(total);
-
-    for (let s = 1; s <= steps; s++) {
-      const zIndep = Array.from({ length: n }, () => standardNormalRandom());
-      const zCorr = matVecMul(L, zIndep); // correlated shocks, variance = Sigma
-      let newTotal = 0;
-      instrumentValues = instrumentValues.map((val, i) => {
-        const mu = selected[i].return;
-        const sigma = selected[i].std;
-        const drift = (mu - 0.5 * sigma * sigma) * dt;
-        const diffusion = zCorr[i] * Math.sqrt(dt);
-        const newVal = val * Math.exp(drift + diffusion);
-        newTotal += newVal;
-        return newVal;
-      });
-      total = newTotal;
-
-      // Periodic rebalance: pay the transaction cost, then reset each
-      // instrument back to its target weight of the post-cost total.
-      if (rebalanceEnabled && s % rebalanceStepInterval === 0 && s !== steps) {
-        const totalAfterCost = total * (1 - costFraction);
-        instrumentValues = weights.map((w) => w * totalAfterCost);
-        total = totalAfterCost;
-      }
-
-      totalsByStep[s].push(total);
-      if (isSampled) path.push(total);
+  // Returns true once every run is finished.
+  function runChunk(budgetMs = Infinity) {
+    const deadline = Number.isFinite(budgetMs) ? Date.now() + budgetMs : Infinity;
+    while (done < simulationsCount) {
+      const size = Math.min(chunkSize, simulationsCount - done);
+      const scen = engine.generate(size, done === 0 ? Math.min(10, simulationsCount) : 0);
+      if (done === 0) trackRaw = scen.trackRaw;
+      evaluateChunkInto(collector, weights, scen, amount, rebalanceInfo);
+      done += size;
+      if (Date.now() >= deadline) break;
     }
-
-    for (let i = 0; i < n; i++) finalInstrumentValues[i].push(instrumentValues[i]);
-    if (isSampled) samplePaths.push(path);
+    return done >= simulationsCount;
   }
 
-  const bands = totalsByStep.map((valuesAtStep, s) => {
-    const sorted = [...valuesAtStep].sort((a, b) => a - b);
+  function progress() {
+    return done / simulationsCount;
+  }
+
+  function finish() {
+    const startValues = weights.map((w) => w * amount);
+    const regimeCounts = engine.regimeCounts;
+    const conditionTracks = buildConditionTracks(
+      { n, baseVols: engine.baseVols, Cbase: engine.Cbase, Cstress: engine.Cstress, trackRaw },
+      weights,
+      selected
+    );
+    const basePortRet = weights.reduce((sum, w, i) => sum + w * selected[i].return, 0);
+    const basePortVol = Math.sqrt(Math.max(dot(weights, matVecMul(Sigma, weights)), 0));
+
+    const bands = collector.bandValues.map((valuesAtStep, s) => {
+      const sorted = valuesAtStep.slice().sort();
+      const p5 = percentileOfSorted(sorted, 5);
+      const p25 = percentileOfSorted(sorted, 25);
+      const p50 = percentileOfSorted(sorted, 50);
+      const p75 = percentileOfSorted(sorted, 75);
+      const p95 = percentileOfSorted(sorted, 95);
+      return {
+        step: s,
+        month: s === 0 ? "Start" : `M${s}`,
+        p5,
+        p25,
+        p50,
+        p75,
+        p95,
+        range90: [p5, p95],
+        range50: [p25, p75],
+      };
+    });
+
+    const finalValues = collector.finals.slice().sort();
+    const N = finalValues.length;
+    let lossCount = 0;
+    for (let i = 0; i < N; i++) if (finalValues[i] < amount) lossCount += 1;
+    const probLoss = lossCount / N;
+
+    // Distribution of final outcomes.
+    const meanFinal = finalValues.reduce((a, b) => a + b, 0) / N;
+    const stdFinal = Math.sqrt(finalValues.reduce((s, v) => s + (v - meanFinal) ** 2, 0) / N);
+    const percentiles = MC_PERCENTILES.map((p) => {
+      const value = percentileOfSorted(finalValues, p);
+      return { p, value, ret: value / amount - 1 };
+    });
+
+    // Value at Risk / Expected Shortfall at 95% confidence, expressed as a
+    // loss versus the amount invested. VaR = loss at the 5th percentile;
+    // CVaR = average loss across the worst 5% of outcomes.
+    const p5Final = percentileOfSorted(finalValues, 5);
+    const tailCount = Math.max(1, Math.floor(N * 0.05));
+    const tailMean = finalValues.slice(0, tailCount).reduce((a, b) => a + b, 0) / tailCount;
+    const var95 = Math.max(0, amount - p5Final);
+    const cvar95 = Math.max(0, amount - tailMean);
+
+    // Max drawdown per path: values are <= 0, so ascending order puts the
+    // deepest drawdowns first. "5th percentile" = a bad-luck drawdown.
+    const sortedDD = collector.maxDD.slice().sort();
+    const medianDrawdown = percentileOfSorted(sortedDD, 50);
+    const worstDrawdown = percentileOfSorted(sortedDD, 5);
+
+    // Annualized return of each path (finalValues is sorted, and the
+    // transform is monotonic, so this stays sorted too).
+    const annualized = finalValues.map((v) => Math.pow(Math.max(v, 1e-9) / amount, 1 / years) - 1);
+    const medianAnnualized = percentileOfSorted(annualized, 50);
+
+    // Histogram of final values. Bins span the 1st-99th percentile so a few
+    // extreme paths don't squash the chart; outliers fall into the edge bins.
+    const binCount = 30;
+    const lo = percentileOfSorted(finalValues, 1);
+    const hi = percentileOfSorted(finalValues, 99);
+    const binWidth = (hi - lo) / binCount || 1;
+    const counts = Array(binCount).fill(0);
+    finalValues.forEach((v) => {
+      let idx = Math.floor((v - lo) / binWidth);
+      idx = Math.min(binCount - 1, Math.max(0, idx));
+      counts[idx] += 1;
+    });
+    const histogram = counts.map((c, i) => {
+      const mid = lo + (i + 0.5) * binWidth;
+      return { mid, pct: (c / N) * 100, isLoss: mid < amount };
+    });
+
+    // Per-instrument worst case, computed two ways for the same buy-and-hold
+    // position: "simulated" is the empirical 5th percentile of that holding on
+    // its own under the selected market model (so it includes regimes and
+    // time-varying volatility); "analytical" is the closed-form constant-
+    // volatility lognormal VaR at 95% confidence from that instrument's return
+    // and std. Both ignore rebalancing, so the gap between them isolates the
+    // effect of the dynamic market model.
+    const z95 = 1.645; // one-tailed 95% confidence
+    const instrumentStats = selected.map((p, i) => {
+      const sortedFinal = collector.hold[i].slice().sort();
+      const startVal = startValues[i];
+      const simulatedWorst = percentileOfSorted(sortedFinal, 5);
+      const analyticalWorst =
+        startVal * Math.exp((p.return - 0.5 * p.std * p.std) * years - z95 * p.std * Math.sqrt(years));
+      return {
+        name: p.name,
+        startValue: startVal,
+        median: percentileOfSorted(sortedFinal, 50),
+        simulatedWorst,
+        analyticalWorst,
+        worstPct: (simulatedWorst / startVal - 1) * 100,
+      };
+    });
+
+    const totalRegimeMonths = regimeCounts.reduce((a, b) => a + b, 0);
+    const regimeShare = dynamic
+      ? REGIME_LABELS.map((label, i) => ({ label, share: regimeCounts[i] / Math.max(1, totalRegimeMonths) }))
+      : null;
+
     return {
-      step: s,
-      month: s === 0 ? "Start" : `M${s}`,
-      p10: percentileOfSorted(sorted, 10),
-      p25: percentileOfSorted(sorted, 25),
-      p50: percentileOfSorted(sorted, 50),
-      p75: percentileOfSorted(sorted, 75),
-      p90: percentileOfSorted(sorted, 90),
+      model,
+      conditionTracks,
+      regimeShare,
+      basePortVol,
+      basePortRet,
+      bands,
+      samplePaths: collector.samplePaths,
+      bandSampleSize: collector.bandCount,
+      steps,
+      finalValues,
+      histogram,
+      percentiles,
+      instrumentStats,
+      stats: {
+        median: percentileOfSorted(finalValues, 50),
+        mean: meanFinal,
+        std: stdFinal,
+        p5: p5Final,
+        p95: percentileOfSorted(finalValues, 95),
+        best: finalValues[N - 1],
+        worst: finalValues[0],
+        probLoss,
+        var95,
+        cvar95,
+        medianDrawdown,
+        worstDrawdown,
+        medianAnnualized,
+      },
     };
-  });
+  }
 
-  const finalValues = [...totalsByStep[steps]].sort((a, b) => a - b);
-  const probLoss = finalValues.filter((v) => v < amount).length / finalValues.length;
+  return { runChunk, progress, finish };
+}
 
-  // Per-instrument worst case, computed two ways from each instrument's own
-  // std: "simulated" is the empirical 5th percentile across this run's
-  // simulated paths for that instrument; "analytical" is the closed-form
-  // lognormal VaR at 95% confidence, straight from that instrument's return
-  // and std (buy-and-hold, ignoring interim rebalancing resets).
-  const z95 = 1.645; // one-tailed 95% confidence
-  const instrumentStats = selected.map((p, i) => {
-    const sortedFinal = [...finalInstrumentValues[i]].sort((a, b) => a - b);
-    const startVal = startValues[i];
-    const simulatedWorst = percentileOfSorted(sortedFinal, 5);
-    const analyticalWorst =
-      startVal * Math.exp((p.return - 0.5 * p.std * p.std) * years - z95 * p.std * Math.sqrt(years));
-    return {
-      name: p.name,
-      startValue: startVal,
-      median: percentileOfSorted(sortedFinal, 50),
-      simulatedWorst,
-      analyticalWorst,
-      worstPct: (simulatedWorst / startVal - 1) * 100,
-    };
-  });
-
-  return {
-    bands,
-    samplePaths,
-    steps,
-    finalValues,
-    instrumentStats,
-    stats: {
-      median: percentileOfSorted(finalValues, 50),
-      p10: percentileOfSorted(finalValues, 10),
-      p90: percentileOfSorted(finalValues, 90),
-      best: finalValues[finalValues.length - 1],
-      worst: finalValues[0],
-      probLoss,
-    },
-  };
+function runMonteCarloSimulation(args) {
+  const job = createMonteCarloJob(args);
+  job.runChunk(Infinity);
+  return job.finish();
 }
 
 // --- ANIMATION HELPERS --------------------------------------------------
@@ -453,6 +1031,18 @@ function useCountUp(target, duration = 900) {
 
 const GlobalStyle = () => (
   <style>{`
+    @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&display=swap');
+    .app-root {
+      font-family: 'Cormorant Garamond', Georgia, 'Times New Roman', serif;
+      font-variant-numeric: lining-nums;
+      font-feature-settings: "lnum" 1;
+      -webkit-font-smoothing: antialiased;
+    }
+    .app-root input, .app-root select, .app-root button, .app-root textarea { font-family: inherit; }
+    .app-root .font-mono { font-family: inherit; font-variant-numeric: lining-nums tabular-nums; }
+    .app-root .text-xs { font-size: 0.92rem !important; line-height: 1.25rem !important; }
+    .app-root .text-sm { font-size: 1.06rem !important; line-height: 1.45rem !important; }
+    .app-root ::selection { background: #fafafa; color: #000; }
     @keyframes fadeUp {
       from { opacity: 0; transform: translateY(10px); }
       to { opacity: 1; transform: translateY(0); }
@@ -467,9 +1057,9 @@ const GlobalStyle = () => (
 
 // --- UI ----------------------------------------------------------------
 const RISK_BADGE_STYLES = {
-  Low: "bg-emerald-950 text-emerald-400 border-emerald-800",
-  Medium: "bg-amber-950 text-amber-400 border-amber-800",
-  High: "bg-rose-950 text-rose-400 border-rose-800",
+  Low: "bg-neutral-900 text-neutral-300 border-neutral-700",
+  Medium: "bg-neutral-800 text-neutral-100 border-neutral-500",
+  High: "bg-white text-black border-white",
 };
 
 const STEPS = [
@@ -485,9 +1075,6 @@ export default function PortfolioAllocationApp() {
   const [products, setProducts] = useState([]);
   const [form, setForm] = useState({
     name: "",
-    ticker: "",
-    mode: "auto",
-    period: "1y",
     returnPct: "",
     stdPct: "",
   });
@@ -506,66 +1093,50 @@ export default function PortfolioAllocationApp() {
   const [editingId, setEditingId] = useState(null);
 
   function resetForm() {
-    setForm({ name: "", ticker: "", mode: "auto", period: "1y", returnPct: "", stdPct: "" });
+    setForm({ name: "", returnPct: "", stdPct: "" });
     setEditingId(null);
   }
 
   function startEditProduct(product) {
     setForm({
       name: product.name,
-      ticker: product.ticker,
-      mode: product.mode,
-      period: product.period || "1y",
-      returnPct: product.mode === "manual" ? String(Number((product.return * 100).toFixed(4))) : "",
-      stdPct: product.mode === "manual" ? String(Number((product.std * 100).toFixed(4))) : "",
+      returnPct: String(Number((product.return * 100).toFixed(4))),
+      stdPct: String(Number((product.std * 100).toFixed(4))),
     });
     setEditingId(product.id);
     setError("");
   }
 
   function handleAddProduct() {
-    if (!form.name.trim() || !form.ticker.trim()) {
-      setError("Product name and ticker are both required.");
+    if (!form.name.trim()) {
+      setError("Product name is required.");
       return;
     }
-    let returnVal;
-    let stdVal;
-    if (form.mode === "auto") {
-      const stats = fetchTickerStats(form.ticker.trim(), form.period);
-      returnVal = stats.return;
-      stdVal = stats.std;
-    } else {
-      returnVal = Number(form.returnPct) / 100;
-      stdVal = Number(form.stdPct) / 100;
-      if (Number.isNaN(returnVal) || Number.isNaN(stdVal)) {
-        setError("Manual return and std must be valid numbers.");
-        return;
-      }
+    if (form.returnPct === "" || form.stdPct === "") {
+      setError("Enter both return (%) and std (%).");
+      return;
+    }
+    const returnVal = Number(form.returnPct) / 100;
+    const stdVal = Number(form.stdPct) / 100;
+    if (Number.isNaN(returnVal) || Number.isNaN(stdVal)) {
+      setError("Return and std must be valid numbers.");
+      return;
+    }
+    if (stdVal <= 0) {
+      setError("Std must be greater than 0.");
+      return;
     }
 
     if (editingId !== null) {
       setProducts((prev) =>
         prev.map((p) =>
-          p.id === editingId
-            ? {
-                ...p,
-                name: form.name.trim(),
-                ticker: form.ticker.trim(),
-                mode: form.mode,
-                period: form.mode === "auto" ? form.period : null,
-                return: returnVal,
-                std: stdVal,
-              }
-            : p
+          p.id === editingId ? { ...p, name: form.name.trim(), return: returnVal, std: stdVal } : p
         )
       );
     } else {
       const newProduct = {
         id: nextId++,
         name: form.name.trim(),
-        ticker: form.ticker.trim(),
-        mode: form.mode,
-        period: form.mode === "auto" ? form.period : null,
         return: returnVal,
         std: stdVal,
       };
@@ -673,19 +1244,19 @@ export default function PortfolioAllocationApp() {
   const stepIndex = STEPS.findIndex((s) => s.key === screen);
 
   return (
-    <div className="min-h-screen w-full bg-slate-950 text-slate-100">
+    <div className="app-root min-h-screen w-full bg-black text-neutral-100">
       <GlobalStyle />
       <div className="w-full max-w-4xl mx-auto px-4 py-6 sm:px-6 sm:py-8 space-y-6">
         {/* Header */}
-        <div className="flex items-center gap-3 pb-4 border-b border-slate-800">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-teal-500/10 border border-teal-800">
-            <TrendingUp className="w-5 h-5 text-teal-400" />
+        <div className="flex items-center gap-3 pb-4 border-b border-neutral-800">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white/5 border border-neutral-600">
+            <TrendingUp className="w-5 h-5 text-neutral-300" />
           </div>
           <div className="min-w-0">
-            <h1 className="text-base sm:text-lg font-semibold text-slate-100 tracking-tight truncate">
+            <h1 className="text-base sm:text-lg font-semibold text-neutral-100 tracking-tight truncate">
               Portfolio Allocation Model
             </h1>
-            <p className="text-xs text-slate-500 hidden sm:block">
+            <p className="text-xs text-neutral-500 hidden sm:block">
               Mean-variance optimization with risk-parity balancing
             </p>
           </div>
@@ -704,18 +1275,18 @@ export default function PortfolioAllocationApp() {
                   disabled={disabled}
                   className={`flex items-center gap-2 shrink-0 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
                     isActive
-                      ? "bg-teal-500 text-slate-950"
+                      ? "bg-neutral-100 text-black"
                       : disabled
-                      ? "text-slate-600 cursor-not-allowed"
-                      : "text-slate-300 hover:bg-slate-900"
+                      ? "text-neutral-600 cursor-not-allowed"
+                      : "text-neutral-300 hover:bg-neutral-900"
                   }`}
                 >
                   {isDone ? (
-                    <CheckCircle2 className="w-4 h-4 text-teal-400" />
+                    <CheckCircle2 className="w-4 h-4 text-neutral-300" />
                   ) : (
                     <span
-                      className={`flex h-5 w-5 items-center justify-center rounded-full text-[11px] font-mono ${
-                        isActive ? "bg-slate-950/20 text-slate-950" : "bg-slate-800 text-slate-400"
+                      className={`flex h-5 w-5 items-center justify-center rounded-full text-[13px] font-mono ${
+                        isActive ? "bg-black/15 text-black" : "bg-neutral-800 text-neutral-400"
                       }`}
                     >
                       {tab.short}
@@ -723,14 +1294,14 @@ export default function PortfolioAllocationApp() {
                   )}
                   <span className="whitespace-nowrap">{tab.label}</span>
                 </button>
-                {i < STEPS.length - 1 && <div className="h-px w-6 sm:w-10 bg-slate-800 shrink-0" />}
+                {i < STEPS.length - 1 && <div className="h-px w-6 sm:w-10 bg-neutral-800 shrink-0" />}
               </React.Fragment>
             );
           })}
         </div>
 
         {error && (
-          <div className="text-sm text-rose-300 bg-rose-950/60 border border-rose-900 rounded-lg px-3 py-2 anim-in">
+          <div className="text-sm text-neutral-100 bg-neutral-900 border border-neutral-500 rounded-lg px-3 py-2 anim-in">
             {error}
           </div>
         )}
@@ -784,7 +1355,7 @@ export default function PortfolioAllocationApp() {
 
 function Card({ children, className = "" }) {
   return (
-    <div className={`rounded-xl border border-slate-800 bg-slate-900/60 backdrop-blur ${className}`}>{children}</div>
+    <div className={`rounded-xl border border-neutral-800 bg-neutral-900/60 backdrop-blur ${className}`}>{children}</div>
   );
 }
 
@@ -804,104 +1375,53 @@ function ConfigScreen({
   const isEditing = editingId !== null;
   return (
     <div className="space-y-5">
-      <Card className={`p-4 sm:p-5 space-y-4 anim-in ${isEditing ? "border-teal-700" : ""}`}>
+      <Card className={`p-4 sm:p-5 space-y-4 anim-in ${isEditing ? "border-neutral-500" : ""}`}>
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-slate-200">{isEditing ? "Edit product" : "Add product"}</h2>
+          <h2 className="text-sm font-semibold text-neutral-200">{isEditing ? "Edit product" : "Add product"}</h2>
           {isEditing && (
-            <span className="text-xs text-teal-400 bg-teal-950/50 border border-teal-800 rounded-full px-2 py-0.5">
+            <span className="text-xs text-neutral-300 bg-white/5 border border-neutral-600 rounded-full px-2 py-0.5">
               Editing
             </span>
           )}
         </div>
+        <div>
+          <label className="block text-xs text-neutral-500 mb-1">Product name</label>
+          <input
+            type="text"
+            value={form.name}
+            onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+            placeholder="e.g. Stocks"
+            className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
+          />
+        </div>
+
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="block text-xs text-slate-500 mb-1">Product name</label>
+            <label className="block text-xs text-neutral-500 mb-1">Return (%)</label>
             <input
-              type="text"
-              value={form.name}
-              onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-              placeholder="e.g. Stocks"
-              className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 placeholder-slate-600 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+              type="number"
+              value={form.returnPct}
+              onChange={(e) => setForm((f) => ({ ...f, returnPct: e.target.value }))}
+              placeholder="e.g. 13"
+              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 placeholder-neutral-600 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
             />
           </div>
           <div>
-            <label className="block text-xs text-slate-500 mb-1">Ticker</label>
+            <label className="block text-xs text-neutral-500 mb-1">Std (%)</label>
             <input
-              type="text"
-              value={form.ticker}
-              onChange={(e) => setForm((f) => ({ ...f, ticker: e.target.value }))}
-              placeholder="e.g. ^NSEI"
-              className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 placeholder-slate-600 font-mono focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+              type="number"
+              value={form.stdPct}
+              onChange={(e) => setForm((f) => ({ ...f, stdPct: e.target.value }))}
+              placeholder="e.g. 18"
+              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 placeholder-neutral-600 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
             />
           </div>
         </div>
-
-        <div>
-          <label className="block text-xs text-slate-500 mb-1.5">Return &amp; std mode</label>
-          <div className="flex gap-2">
-            {["auto", "manual"].map((m) => (
-              <button
-                key={m}
-                onClick={() => setForm((f) => ({ ...f, mode: m }))}
-                className={`px-3 py-1.5 text-sm rounded-md border capitalize transition-colors ${
-                  form.mode === m
-                    ? "bg-teal-500 text-slate-950 border-teal-500 font-medium"
-                    : "bg-slate-950 text-slate-400 border-slate-700 hover:border-slate-600"
-                }`}
-              >
-                {m}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {form.mode === "auto" ? (
-          <div>
-            <label className="block text-xs text-slate-500 mb-1">Period</label>
-            <select
-              value={form.period}
-              onChange={(e) => setForm((f) => ({ ...f, period: e.target.value }))}
-              className="w-32 text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
-            >
-              {PERIOD_OPTIONS.map((p) => (
-                <option key={p.value} value={p.value}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
-            <p className="text-xs text-slate-500 mt-1.5">
-              Return and std will be calculated from the ticker's historical data for this period.
-            </p>
-          </div>
-        ) : (
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs text-slate-500 mb-1">Return (%)</label>
-              <input
-                type="number"
-                value={form.returnPct}
-                onChange={(e) => setForm((f) => ({ ...f, returnPct: e.target.value }))}
-                placeholder="e.g. 13"
-                className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 placeholder-slate-600 font-mono focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-slate-500 mb-1">Std (%)</label>
-              <input
-                type="number"
-                value={form.stdPct}
-                onChange={(e) => setForm((f) => ({ ...f, stdPct: e.target.value }))}
-                placeholder="e.g. 18"
-                className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 placeholder-slate-600 font-mono focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
-              />
-            </div>
-          </div>
-        )}
 
         <div className="flex items-center gap-2">
           <button
             onClick={onAdd}
-            className="flex items-center gap-1.5 text-sm bg-teal-500 hover:bg-teal-400 text-slate-950 font-medium px-3.5 py-2 rounded-md transition-colors"
+            className="flex items-center gap-1.5 text-sm bg-neutral-100 hover:bg-white text-black font-medium px-3.5 py-2 rounded-md transition-colors"
           >
             {isEditing ? <Save className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
             {isEditing ? "Update product" : "Add product"}
@@ -909,7 +1429,7 @@ function ConfigScreen({
           {isEditing && (
             <button
               onClick={onCancelEdit}
-              className="flex items-center gap-1.5 text-sm text-slate-300 border border-slate-700 hover:bg-slate-800 px-3.5 py-2 rounded-md transition-colors"
+              className="flex items-center gap-1.5 text-sm text-neutral-300 border border-neutral-700 hover:bg-neutral-800 px-3.5 py-2 rounded-md transition-colors"
             >
               <X className="w-4 h-4" />
               Cancel
@@ -919,20 +1439,17 @@ function ConfigScreen({
       </Card>
 
       <Card className="overflow-hidden anim-in">
-        <div className="px-4 py-3 bg-slate-900 border-b border-slate-800">
-          <h2 className="text-sm font-semibold text-slate-200">Configured products ({products.length})</h2>
+        <div className="px-4 py-3 bg-neutral-900 border-b border-neutral-800">
+          <h2 className="text-sm font-semibold text-neutral-200">Configured products ({products.length})</h2>
         </div>
         {products.length === 0 ? (
-          <p className="text-sm text-slate-500 px-4 py-8 text-center">No products added yet.</p>
+          <p className="text-sm text-neutral-500 px-4 py-8 text-center">No products added yet.</p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm min-w-[560px]">
+            <table className="w-full text-sm min-w-[360px]">
               <thead>
-                <tr className="text-left text-xs text-slate-500 border-b border-slate-800">
+                <tr className="text-left text-xs text-neutral-500 border-b border-neutral-800">
                   <th className="px-4 py-2 font-medium">Name</th>
-                  <th className="px-4 py-2 font-medium">Ticker</th>
-                  <th className="px-4 py-2 font-medium">Mode</th>
-                  <th className="px-4 py-2 font-medium">Period</th>
                   <th className="px-4 py-2 font-medium">Return</th>
                   <th className="px-4 py-2 font-medium">Std</th>
                   <th className="px-4 py-2 font-medium" />
@@ -942,30 +1459,25 @@ function ConfigScreen({
                 {products.map((p) => (
                   <tr
                     key={p.id}
-                    className={`border-b border-slate-800/60 last:border-0 hover:bg-slate-900/60 ${
-                      p.id === editingId ? "bg-teal-950/30" : ""
+                    className={`border-b border-neutral-800/60 last:border-0 hover:bg-neutral-900/60 ${
+                      p.id === editingId ? "bg-white/5" : ""
                     }`}
                   >
-                    <td className="px-4 py-2.5 text-slate-200">{p.name}</td>
-                    <td className="px-4 py-2.5 text-slate-500 font-mono">{p.ticker}</td>
-                    <td className="px-4 py-2.5 capitalize text-slate-400">{p.mode}</td>
-                    <td className="px-4 py-2.5 text-slate-400">
-                      {p.period ? PERIOD_OPTIONS.find((o) => o.value === p.period)?.label : "-"}
-                    </td>
-                    <td className="px-4 py-2.5 font-mono text-emerald-400">{(p.return * 100).toFixed(2)}%</td>
-                    <td className="px-4 py-2.5 font-mono text-slate-300">{(p.std * 100).toFixed(2)}%</td>
+                    <td className="px-4 py-2.5 text-neutral-200">{p.name}</td>
+                    <td className="px-4 py-2.5 font-mono text-white">{(p.return * 100).toFixed(2)}%</td>
+                    <td className="px-4 py-2.5 font-mono text-neutral-300">{(p.std * 100).toFixed(2)}%</td>
                     <td className="px-4 py-2.5 text-right">
                       <div className="flex items-center justify-end gap-2">
                         <button
                           onClick={() => onEdit(p)}
-                          className="text-slate-600 hover:text-teal-400 transition-colors"
+                          className="text-neutral-600 hover:text-white transition-colors"
                           title="Edit product"
                         >
                           <Pencil className="w-4 h-4" />
                         </button>
                         <button
                           onClick={() => onRemove(p.id)}
-                          className="text-slate-600 hover:text-rose-400 transition-colors"
+                          className="text-neutral-600 hover:text-white transition-colors"
                           title="Delete product"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -982,19 +1494,19 @@ function ConfigScreen({
 
       {products.length >= 2 && (
         <Card className="overflow-hidden anim-in">
-          <div className="px-4 py-3 bg-slate-900 border-b border-slate-800">
-            <h2 className="text-sm font-semibold text-slate-200">Correlation matrix</h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Auto-calculated from ticker data; you can manually edit any cell (between -1 and 1).
+          <div className="px-4 py-3 bg-neutral-900 border-b border-neutral-800">
+            <h2 className="text-sm font-semibold text-neutral-200">Correlation matrix</h2>
+            <p className="text-xs text-neutral-500 mt-0.5">
+              Set the correlation for each pair (between -1 and 1). Pairs you have not set default to 0 (uncorrelated).
             </p>
           </div>
           <div className="overflow-x-auto">
             <table className="text-sm">
               <thead>
                 <tr>
-                  <th className="px-3 py-2 sticky left-0 bg-slate-900 z-10" />
+                  <th className="px-3 py-2 sticky left-0 bg-neutral-900 z-10" />
                   {products.map((p) => (
-                    <th key={p.id} className="px-3 py-2 text-xs font-medium text-slate-500 whitespace-nowrap">
+                    <th key={p.id} className="px-3 py-2 text-xs font-medium text-neutral-500 whitespace-nowrap">
                       {p.name}
                     </th>
                   ))}
@@ -1002,14 +1514,14 @@ function ConfigScreen({
               </thead>
               <tbody>
                 {products.map((rowP) => (
-                  <tr key={rowP.id} className="border-t border-slate-800">
-                    <td className="px-3 py-2 text-xs text-slate-400 whitespace-nowrap sticky left-0 bg-slate-900/95 z-10">
+                  <tr key={rowP.id} className="border-t border-neutral-800">
+                    <td className="px-3 py-2 text-xs text-neutral-400 whitespace-nowrap sticky left-0 bg-neutral-900/95 z-10">
                       {rowP.name}
                     </td>
                     {products.map((colP) => {
                       if (rowP.id === colP.id) {
                         return (
-                          <td key={colP.id} className="px-3 py-2 text-center text-slate-600 font-mono">
+                          <td key={colP.id} className="px-3 py-2 text-center text-neutral-600 font-mono">
                             1.00
                           </td>
                         );
@@ -1018,7 +1530,7 @@ function ConfigScreen({
                       const isOverridden = corrOverrides[key] !== undefined;
                       const value = getCorrelation(rowP, colP, corrOverrides);
                       return (
-                        <td key={colP.id} className={`px-2 py-1.5 text-center ${isOverridden ? "bg-amber-950/40" : ""}`}>
+                        <td key={colP.id} className={`px-2 py-1.5 text-center ${isOverridden ? "bg-white/10" : ""}`}>
                           <div className="flex items-center justify-center gap-1">
                             <input
                               type="number"
@@ -1031,12 +1543,12 @@ function ConfigScreen({
                                 if (Number.isNaN(num)) return;
                                 onCorrChange(rowP.id, colP.id, Math.max(-1, Math.min(1, num)));
                               }}
-                              className="w-16 text-sm text-center font-mono bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-slate-100 focus:outline-none focus:border-teal-500"
+                              className="w-16 text-sm text-center font-mono bg-black border border-neutral-700 rounded px-1 py-0.5 text-neutral-100 focus:outline-none focus:border-neutral-300"
                             />
                             {isOverridden && (
                               <button
                                 onClick={() => onCorrReset(rowP.id, colP.id)}
-                                className="text-slate-600 hover:text-slate-300"
+                                className="text-neutral-600 hover:text-neutral-300"
                                 title="Reset to calculated value"
                               >
                                 <RotateCcw className="w-3 h-3" />
@@ -1081,24 +1593,24 @@ function RunScreen({
     <div className="space-y-5">
       <Card className="p-4 sm:p-5 space-y-5 anim-in">
         <div>
-          <label className="block text-xs text-slate-500 mb-1">Investment amount</label>
+          <label className="block text-xs text-neutral-500 mb-1">Investment amount</label>
           <div className="relative w-full sm:w-64">
-            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm">₹</span>
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 text-sm">₹</span>
             <input
               type="number"
               value={amount}
               onChange={(e) => setAmount(Number(e.target.value))}
-              className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md pl-7 pr-2.5 py-2 text-slate-100 font-mono focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+              className="w-full text-sm bg-black border border-neutral-700 rounded-md pl-7 pr-2.5 py-2 text-neutral-100 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
             />
           </div>
         </div>
 
         <div>
-          <label className="block text-xs text-slate-500 mb-2">
-            Select 2-5 products <span className="text-slate-600">({selectedIds.length} selected)</span>
+          <label className="block text-xs text-neutral-500 mb-2">
+            Select 2-5 products <span className="text-neutral-600">({selectedIds.length} selected)</span>
           </label>
           {products.length === 0 ? (
-            <p className="text-sm text-slate-500">Add products from the config screen first.</p>
+            <p className="text-sm text-neutral-500">Add products from the config screen first.</p>
           ) : (
             <div className="space-y-1.5">
               {products.map((p) => {
@@ -1107,18 +1619,17 @@ function RunScreen({
                   <label
                     key={p.id}
                     className={`flex items-center gap-3 text-sm rounded-md px-3 py-2.5 cursor-pointer border transition-colors ${
-                      checked ? "border-teal-700 bg-teal-950/30" : "border-slate-800 hover:border-slate-700"
+                      checked ? "border-neutral-500 bg-white/5" : "border-neutral-800 hover:border-neutral-700"
                     }`}
                   >
                     <input
                       type="checkbox"
                       checked={checked}
                       onChange={() => onToggle(p.id)}
-                      className="accent-teal-500"
+                      className="accent-white"
                     />
-                    <span className="flex-1 text-slate-200 min-w-0 truncate">{p.name}</span>
-                    <span className="text-slate-500 text-xs font-mono hidden sm:inline">{p.ticker}</span>
-                    <span className="text-slate-400 text-xs font-mono whitespace-nowrap">
+                    <span className="flex-1 text-neutral-200 min-w-0 truncate">{p.name}</span>
+                    <span className="text-neutral-400 text-xs font-mono whitespace-nowrap">
                       {(p.return * 100).toFixed(1)}% / {(p.std * 100).toFixed(1)}%
                     </span>
                   </label>
@@ -1130,11 +1641,11 @@ function RunScreen({
 
         <div className="grid grid-cols-2 gap-4">
           <div>
-            <label className="block text-xs text-slate-500 mb-1">Return vs safety</label>
+            <label className="block text-xs text-neutral-500 mb-1">Return vs safety</label>
             <select
               value={returnSafety}
               onChange={(e) => setReturnSafety(e.target.value)}
-              className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
             >
               <option value="safety">Safety</option>
               <option value="balanced">Balanced</option>
@@ -1142,11 +1653,11 @@ function RunScreen({
             </select>
           </div>
           <div>
-            <label className="block text-xs text-slate-500 mb-1">Risk tolerance</label>
+            <label className="block text-xs text-neutral-500 mb-1">Risk tolerance</label>
             <select
               value={riskTolerance}
               onChange={(e) => setRiskTolerance(e.target.value)}
-              className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
             >
               <option value="low">Low</option>
               <option value="medium">Medium</option>
@@ -1155,38 +1666,38 @@ function RunScreen({
           </div>
         </div>
 
-        <label className="flex items-center gap-2 text-sm text-slate-300">
+        <label className="flex items-center gap-2 text-sm text-neutral-300">
           <input
             type="checkbox"
             checked={diversify}
             onChange={(e) => setDiversify(e.target.checked)}
-            className="accent-teal-500"
+            className="accent-white"
           />
           Use equal risk allocation (diversification)
         </label>
 
-        <div className="rounded-lg border border-slate-800 px-3.5 py-3 space-y-3">
-          <label className="flex items-center gap-2 text-sm text-slate-300">
+        <div className="rounded-lg border border-neutral-800 px-3.5 py-3 space-y-3">
+          <label className="flex items-center gap-2 text-sm text-neutral-300">
             <input
               type="checkbox"
               checked={rebalance}
               onChange={(e) => setRebalance(e.target.checked)}
-              className="accent-teal-500"
+              className="accent-white"
             />
-            Simulate periodic rebalancing <span className="text-slate-600 text-xs">(optional)</span>
+            Simulate periodic rebalancing <span className="text-neutral-600 text-xs">(optional)</span>
           </label>
-          <p className="text-xs text-slate-500 pl-6">
+          <p className="text-xs text-neutral-500 pl-6">
             Resetting weights back to target periodically costs a little in fees/taxes each time — this reduces the
             expected return slightly. Leave unchecked to see returns without rebalancing.
           </p>
           {rebalance && (
             <div className="grid grid-cols-2 gap-3 pl-6 pt-1">
               <div>
-                <label className="block text-xs text-slate-500 mb-1">Frequency</label>
+                <label className="block text-xs text-neutral-500 mb-1">Frequency</label>
                 <select
                   value={rebalanceFrequency}
                   onChange={(e) => setRebalanceFrequency(e.target.value)}
-                  className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+                  className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
                 >
                   {REBALANCE_FREQUENCY_OPTIONS.map((f) => (
                     <option key={f.value} value={f.value}>
@@ -1196,14 +1707,14 @@ function RunScreen({
                 </select>
               </div>
               <div>
-                <label className="block text-xs text-slate-500 mb-1">Cost per rebalance (%)</label>
+                <label className="block text-xs text-neutral-500 mb-1">Cost per rebalance (%)</label>
                 <input
                   type="number"
                   step="0.1"
                   min="0"
                   value={rebalanceCost}
                   onChange={(e) => setRebalanceCost(e.target.value)}
-                  className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 font-mono focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+                  className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
                 />
               </div>
             </div>
@@ -1212,12 +1723,30 @@ function RunScreen({
 
         <button
           onClick={onRun}
-          className="flex items-center gap-1.5 text-sm bg-teal-500 hover:bg-teal-400 text-slate-950 font-medium px-4 py-2.5 rounded-md transition-colors"
+          className="flex items-center gap-1.5 text-sm bg-neutral-100 hover:bg-white text-black font-medium px-4 py-2.5 rounded-md transition-colors"
         >
           <Play className="w-4 h-4" />
           Run model
         </button>
       </Card>
+    </div>
+  );
+}
+
+const TOOLTIP_STYLE = {
+  backgroundColor: "#0a0a0a",
+  border: "1px solid #262626",
+  borderRadius: 8,
+  fontSize: 14,
+  color: "#e5e5e5",
+};
+
+function StatBox({ label, value, tone = "text-neutral-100", hint }) {
+  return (
+    <div className="rounded-lg border border-neutral-800 px-3 py-2.5">
+      <p className="text-xs text-neutral-500">{label}</p>
+      <p className={`text-sm font-semibold font-mono ${tone}`}>{value}</p>
+      {hint && <p className="text-[13px] text-neutral-600 mt-0.5">{hint}</p>}
     </div>
   );
 }
@@ -1232,30 +1761,109 @@ function ResultScreen({ result, amount, chartData, onBack }) {
   const animValue = useCountUp(expectedValue);
 
   const [mcHorizon, setMcHorizon] = useState("1");
-  const [mcSimCount, setMcSimCount] = useState(500);
-  const [mcTargetPct, setMcTargetPct] = useState(20);
+  const [mcSimCount, setMcSimCount] = useState(1000);
+  const [mcModel, setMcModel] = useState("dynamic");
+  const [mcPreset, setMcPreset] = useState("realistic");
+  const [mcLinkMode, setMcLinkMode] = useState("real");
+  const [mcParamText, setMcParamText] = useState(() => paramsToText(MARKET_PRESETS.realistic));
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [condIdx, setCondIdx] = useState(0);
   const [mcRunning, setMcRunning] = useState(false);
+  const [mcBigRun, setMcBigRun] = useState(false);
+  const [mcProgress, setMcProgress] = useState(0);
+  const [mcElapsed, setMcElapsed] = useState(0);
   const [mcOutput, setMcOutput] = useState(null);
+  const mcCancelRef = useRef(false);
+  const mcUnmountedRef = useRef(false);
+  const mcTimerRef = useRef(null);
 
+  // Reset on every mount so it also works under React StrictMode (which
+  // mounts, unmounts and re-mounts once in development).
+  useEffect(() => {
+    mcUnmountedRef.current = false;
+    return () => {
+      mcUnmountedRef.current = true;
+      if (mcTimerRef.current) clearTimeout(mcTimerRef.current);
+    };
+  }, []);
+
+  function handlePresetChange(value) {
+    setMcPreset(value);
+    if (value !== "custom") setMcParamText(paramsToText(MARKET_PRESETS[value]));
+  }
+
+  function handleParamChange(key, value) {
+    setMcParamText((prev) => ({ ...prev, [key]: value }));
+    setMcPreset("custom");
+  }
+
+  // Runs up to 5,000 futures in one go; larger runs are done in small time
+  // slices with a progress bar (and a Stop button) so the page never freezes.
   function handleRunMonteCarlo() {
+    const horizon = MC_HORIZON_OPTIONS.find((h) => h.value === mcHorizon);
+    const runCount = mcSimCount;
+    const big = runCount > 5000;
+    mcCancelRef.current = false;
     setMcRunning(true);
-    // Defer one tick so the "Running..." state paints before the (brief) computation.
-    setTimeout(() => {
-      const horizon = MC_HORIZON_OPTIONS.find((h) => h.value === mcHorizon);
-      const output = runMonteCarloSimulation({
+    setMcBigRun(big);
+    setMcProgress(0);
+    setMcElapsed(0);
+    if (big) setMcOutput(null); // the heavy charts would otherwise redraw on every progress update
+    // Defer so the "Running..." state paints before the computation starts.
+    mcTimerRef.current = setTimeout(() => {
+      if (mcUnmountedRef.current) return;
+      const job = createMonteCarloJob({
         selected,
         weights,
         amount,
         Sigma,
         years: horizon.years,
-        simulationsCount: mcSimCount,
+        simulationsCount: runCount,
         rebalanceInfo: rebalance,
+        model: mcModel,
+        marketParams: sanitizeMarketParams(mcParamText, mcLinkMode),
       });
-      const targetValue = amount * (1 + Number(mcTargetPct) / 100);
-      const probTarget = output.finalValues.filter((v) => v >= targetValue).length / output.finalValues.length;
-      setMcOutput({ ...output, targetValue, probTarget, horizonLabel: horizon.label });
-      setMcRunning(false);
+      const complete = () => {
+        if (mcUnmountedRef.current) return;
+        const output = job.finish();
+        setCondIdx(0);
+        setMcOutput({ ...output, horizonLabel: horizon.label, simCount: runCount });
+        setMcRunning(false);
+      };
+      if (!big) {
+        job.runChunk(Infinity);
+        complete();
+        return;
+      }
+      const startedAt = Date.now();
+      let lastUi = 0;
+      const tick = () => {
+        if (mcUnmountedRef.current) return;
+        if (mcCancelRef.current) {
+          setMcRunning(false);
+          return;
+        }
+        const finished = job.runChunk(40);
+        const now = Date.now();
+        if (finished) {
+          setMcProgress(1);
+          setMcElapsed((now - startedAt) / 1000);
+          mcTimerRef.current = setTimeout(complete, 30); // let "Calculating statistics..." paint
+          return;
+        }
+        if (now - lastUi > 150) {
+          lastUi = now;
+          setMcProgress(job.progress());
+          setMcElapsed((now - startedAt) / 1000);
+        }
+        mcTimerRef.current = setTimeout(tick, 0);
+      };
+      tick();
     }, 30);
+  }
+
+  function handleStopMonteCarlo() {
+    mcCancelRef.current = true;
   }
 
   // Reshape the capped sample of individual simulated paths into one row per
@@ -1274,26 +1882,39 @@ function ResultScreen({ result, amount, chartData, onBack }) {
     return rows;
   }, [mcOutput]);
 
+  // One simulated path's month-by-month conditions: effective portfolio std
+  // and effective expected return (annualised %), plus the market regime.
+  const conditionData = useMemo(() => {
+    if (!mcOutput || !mcOutput.conditionTracks || mcOutput.conditionTracks.length === 0) return [];
+    const track = mcOutput.conditionTracks[condIdx % mcOutput.conditionTracks.length];
+    return track.map((t) => ({
+      month: `M${t.month}`,
+      std: t.std * 100,
+      ret: t.ret * 100,
+      regime: t.regime,
+    }));
+  }, [mcOutput, condIdx]);
+
   return (
     <div className="space-y-5">
       {/* Metric cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <MetricCard
-          icon={<TrendingUp className="w-4 h-4 text-emerald-400" />}
+          icon={<TrendingUp className="w-4 h-4 text-white" />}
           label="Expected return"
           value={`${animReturn.toFixed(2)}%`}
           subValue={rebalance?.enabled ? `${(portReturn * 100).toFixed(2)}% before rebalancing cost` : undefined}
           delay={0}
         />
         <MetricCard
-          icon={<Activity className="w-4 h-4 text-indigo-400" />}
+          icon={<Activity className="w-4 h-4 text-neutral-300" />}
           label="Volatility"
           value={`${animVol.toFixed(2)}%`}
           subValue={`₹${Math.round((animVol / 100) * amount).toLocaleString("en-IN")}`}
           delay={60}
         />
         <MetricCard
-          icon={<Gauge className="w-4 h-4 text-amber-400" />}
+          icon={<Gauge className="w-4 h-4 text-neutral-300" />}
           label="Risk-reward ratio"
           value={animSharpe.toFixed(2)}
           delay={120}
@@ -1313,7 +1934,7 @@ function ResultScreen({ result, amount, chartData, onBack }) {
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card className="p-4 sm:p-5 anim-in" style={{ animationDelay: "100ms" }}>
-          <h2 className="text-sm font-semibold text-slate-200 mb-3">Allocation split</h2>
+          <h2 className="text-sm font-semibold text-neutral-200 mb-3">Allocation split</h2>
           <ResponsiveContainer width="100%" height={240}>
             <PieChart>
               <Pie
@@ -1328,63 +1949,51 @@ function ResultScreen({ result, amount, chartData, onBack }) {
                 animationEasing="ease-out"
               >
                 {chartData.map((_, i) => (
-                  <Cell key={i} fill={SERIES_COLORS[i % SERIES_COLORS.length]} stroke="#020617" strokeWidth={2} />
+                  <Cell key={i} fill={SERIES_COLORS[i % SERIES_COLORS.length]} stroke="#000000" strokeWidth={2} />
                 ))}
               </Pie>
               <Tooltip
                 formatter={(v) => [`${v}%`, "Allocation"]}
-                itemStyle={{ color: "#e2e8f0" }}
-                labelStyle={{ color: "#e2e8f0", fontWeight: 600 }}
-                contentStyle={{
-                  backgroundColor: "#0f172a",
-                  border: "1px solid #1e293b",
-                  borderRadius: 8,
-                  fontSize: 12,
-                  color: "#e2e8f0",
-                }}
+                itemStyle={{ color: "#e5e5e5" }}
+                labelStyle={{ color: "#e5e5e5", fontWeight: 600 }}
+                contentStyle={TOOLTIP_STYLE}
               />
               <Legend
                 verticalAlign="bottom"
                 iconType="circle"
                 iconSize={8}
-                wrapperStyle={{ fontSize: 12, color: "#94a3b8" }}
+                wrapperStyle={{ fontSize: 14, color: "#a3a3a3" }}
               />
             </PieChart>
           </ResponsiveContainer>
         </Card>
 
         <Card className="p-4 sm:p-5 anim-in" style={{ animationDelay: "160ms" }}>
-          <h2 className="text-sm font-semibold text-slate-200 mb-3">Allocation by weight</h2>
+          <h2 className="text-sm font-semibold text-neutral-200 mb-3">Allocation by weight</h2>
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={chartData} margin={{ top: 4, right: 8, left: -8, bottom: 28 }}>
               <defs>
                 <linearGradient id="barGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#2dd4bf" stopOpacity={1} />
-                  <stop offset="100%" stopColor="#0f766e" stopOpacity={0.9} />
+                  <stop offset="0%" stopColor="#fafafa" stopOpacity={1} />
+                  <stop offset="100%" stopColor="#737373" stopOpacity={0.9} />
                 </linearGradient>
               </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+              <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
               <XAxis
                 dataKey="name"
-                tick={{ fontSize: 11, fill: "#94a3b8" }}
+                tick={{ fontSize: 13, fill: "#a3a3a3" }}
                 interval={0}
                 angle={-25}
                 textAnchor="end"
                 height={50}
               />
-              <YAxis tick={{ fontSize: 11, fill: "#94a3b8" }} unit="%" width={40} />
+              <YAxis tick={{ fontSize: 13, fill: "#a3a3a3" }} unit="%" width={40} />
               <Tooltip
                 formatter={(v) => [`${v}%`, "Allocation"]}
-                cursor={{ fill: "#1e293b", opacity: 0.4 }}
-                itemStyle={{ color: "#e2e8f0" }}
-                labelStyle={{ color: "#e2e8f0", fontWeight: 600 }}
-                contentStyle={{
-                  backgroundColor: "#0f172a",
-                  border: "1px solid #1e293b",
-                  borderRadius: 8,
-                  fontSize: 12,
-                  color: "#e2e8f0",
-                }}
+                cursor={{ fill: "#262626", opacity: 0.4 }}
+                itemStyle={{ color: "#e5e5e5" }}
+                labelStyle={{ color: "#e5e5e5", fontWeight: 600 }}
+                contentStyle={TOOLTIP_STYLE}
               />
               <Bar
                 dataKey="allocation"
@@ -1401,25 +2010,25 @@ function ResultScreen({ result, amount, chartData, onBack }) {
 
       {/* Holdings breakdown */}
       <Card className="p-4 sm:p-5 anim-in" style={{ animationDelay: "220ms" }}>
-        <h2 className="text-sm font-semibold text-slate-200 mb-3">Holdings</h2>
+        <h2 className="text-sm font-semibold text-neutral-200 mb-3">Holdings</h2>
         <div className="space-y-3">
           {selected.map((p, i) => {
             const pct = weights[i] * 100;
             return (
               <div key={p.id}>
                 <div className="flex justify-between text-sm mb-1">
-                  <span className="text-slate-200 flex items-center gap-2 min-w-0">
+                  <span className="text-neutral-200 flex items-center gap-2 min-w-0">
                     <span
                       className="h-2 w-2 rounded-full shrink-0"
                       style={{ backgroundColor: SERIES_COLORS[i % SERIES_COLORS.length] }}
                     />
                     <span className="truncate">{p.name}</span>
                   </span>
-                  <span className="text-slate-400 font-mono whitespace-nowrap">
+                  <span className="text-neutral-400 font-mono whitespace-nowrap">
                     {pct.toFixed(2)}% · ₹{Math.round(weights[i] * amount).toLocaleString("en-IN")}
                   </span>
                 </div>
-                <div className="h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
+                <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden">
                   <div
                     className="h-full rounded-full anim-bar"
                     style={{
@@ -1437,19 +2046,19 @@ function ResultScreen({ result, amount, chartData, onBack }) {
 
       <Card className="p-4 sm:p-5 anim-in" style={{ animationDelay: "280ms" }}>
         <div className="flex items-center gap-2 mb-1">
-          <Wallet className="w-4 h-4 text-teal-400" />
-          <p className="text-xs text-slate-500">Projected value after 1 year</p>
+          <Wallet className="w-4 h-4 text-neutral-300" />
+          <p className="text-xs text-neutral-500">Projected value after 1 year</p>
         </div>
-        <p className="text-2xl sm:text-3xl font-semibold text-slate-100 font-mono">
+        <p className="text-2xl sm:text-3xl font-semibold text-neutral-100 font-mono">
           ₹{Math.round(animValue).toLocaleString("en-IN")}
         </p>
         {rebalance?.enabled && (
-          <div className="flex items-start gap-2 mt-3 pt-3 border-t border-slate-800">
-            <RefreshCw className="w-3.5 h-3.5 text-indigo-400 mt-0.5 shrink-0" />
-            <p className="text-xs text-slate-500">
-              Includes <span className="text-slate-300">{rebalance.frequencyLabel.toLowerCase()}</span> rebalancing at{" "}
-              <span className="text-slate-300 font-mono">{rebalance.costPct}%</span> per rebalance — a{" "}
-              <span className="text-slate-300 font-mono">{(rebalance.drag * 100).toFixed(2)}%</span> annual drag on
+          <div className="flex items-start gap-2 mt-3 pt-3 border-t border-neutral-800">
+            <RefreshCw className="w-3.5 h-3.5 text-neutral-300 mt-0.5 shrink-0" />
+            <p className="text-xs text-neutral-500">
+              Includes <span className="text-neutral-300">{rebalance.frequencyLabel.toLowerCase()}</span> rebalancing at{" "}
+              <span className="text-neutral-300 font-mono">{rebalance.costPct}%</span> per rebalance — a{" "}
+              <span className="text-neutral-300 font-mono">{(rebalance.drag * 100).toFixed(2)}%</span> annual drag on
               returns.
             </p>
           </div>
@@ -1459,22 +2068,25 @@ function ResultScreen({ result, amount, chartData, onBack }) {
       {/* Monte Carlo simulation */}
       <Card className="p-4 sm:p-5 anim-in" style={{ animationDelay: "320ms" }}>
         <div className="flex items-center gap-2 mb-1">
-          <Dices className="w-4 h-4 text-indigo-400" />
-          <h2 className="text-sm font-semibold text-slate-200">Monte Carlo simulation</h2>
+          <Dices className="w-4 h-4 text-neutral-300" />
+          <h2 className="text-sm font-semibold text-neutral-200">Monte Carlo simulation</h2>
         </div>
-        <p className="text-xs text-slate-500 mb-4">
+        <p className="text-xs text-neutral-500 mb-4">
           Runs many random future paths, simulating each holding separately with its own return and volatility
-          (Geometric Brownian Motion) while keeping their correlations intact, to show a realistic spread of outcomes
-          — not just one projected number.
+          while keeping their correlations intact, to show the full distribution of outcomes — not just one
+          projected number. The <span className="text-neutral-300">Dynamic</span> model lets std, return and correlation
+          change month by month (calm / normal / stress regimes, market-wide and per-holding volatility moving above
+          and below your input, return linked to volatility, and correlations rising in stress) like a real market;{" "}
+          <span className="text-neutral-300">Constant</span> keeps them fixed for the whole horizon.
         </p>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
           <div>
-            <label className="block text-xs text-slate-500 mb-1">Time horizon</label>
+            <label className="block text-xs text-neutral-500 mb-1">Time horizon</label>
             <select
               value={mcHorizon}
               onChange={(e) => setMcHorizon(e.target.value)}
-              className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
             >
               {MC_HORIZON_OPTIONS.map((h) => (
                 <option key={h.value} value={h.value}>
@@ -1484,11 +2096,11 @@ function ResultScreen({ result, amount, chartData, onBack }) {
             </select>
           </div>
           <div>
-            <label className="block text-xs text-slate-500 mb-1">Simulations</label>
+            <label className="block text-xs text-neutral-500 mb-1">Simulations</label>
             <select
               value={mcSimCount}
               onChange={(e) => setMcSimCount(Number(e.target.value))}
-              className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
             >
               {MC_SIM_COUNT_OPTIONS.map((n) => (
                 <option key={n} value={n}>
@@ -1498,193 +2110,473 @@ function ResultScreen({ result, amount, chartData, onBack }) {
             </select>
           </div>
           <div className="col-span-2 sm:col-span-1">
-            <label className="block text-xs text-slate-500 mb-1">Target gain (%)</label>
-            <input
-              type="number"
-              step="1"
-              value={mcTargetPct}
-              onChange={(e) => setMcTargetPct(e.target.value)}
-              className="w-full text-sm bg-slate-950 border border-slate-700 rounded-md px-2.5 py-2 text-slate-100 font-mono focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
-            />
+            <label className="block text-xs text-neutral-500 mb-1">Market model</label>
+            <select
+              value={mcModel}
+              onChange={(e) => setMcModel(e.target.value)}
+              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
+            >
+              {MC_MODEL_OPTIONS.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
 
-        <button
-          onClick={handleRunMonteCarlo}
-          disabled={mcRunning}
-          className="flex items-center gap-1.5 text-sm bg-indigo-500 hover:bg-indigo-400 disabled:opacity-60 text-slate-950 font-medium px-3.5 py-2 rounded-md transition-colors mb-5"
-        >
-          {mcRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Dices className="w-4 h-4" />}
-          {mcRunning ? "Running..." : mcOutput ? "Re-run simulation" : "Run simulation"}
-        </button>
+        {mcSimCount >= 50000 && (
+          <p className="text-xs text-neutral-500 mb-4">
+            {mcSimCount.toLocaleString("en-IN")} runs can take from several seconds to a few minutes depending on your
+            device and time horizon. Progress is shown and you can stop at any time. The fan-chart bands use the first
+            20,000 runs (plenty for stable percentiles); every other statistic uses all runs.
+          </p>
+        )}
+
+        {mcModel === "dynamic" && (
+          <div className="space-y-3 mb-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-neutral-500 mb-1">Market severity</label>
+                <select
+                  value={mcPreset}
+                  onChange={(e) => handlePresetChange(e.target.value)}
+                  className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
+                >
+                  {Object.entries(MARKET_PRESETS).map(([key, preset]) => (
+                    <option key={key} value={key}>
+                      {preset.label}
+                    </option>
+                  ))}
+                  <option value="custom">Custom</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-neutral-500 mb-1">Return vs volatility</label>
+                <select
+                  value={mcLinkMode}
+                  onChange={(e) => setMcLinkMode(e.target.value)}
+                  className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
+                >
+                  {RETURN_LINK_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-neutral-800">
+              <button
+                onClick={() => setShowAdvanced((v) => !v)}
+                className="w-full flex items-center justify-between px-3.5 py-2.5 text-sm text-neutral-300 hover:bg-neutral-900/60 rounded-lg transition-colors"
+              >
+                <span>Advanced market settings</span>
+                <span className="text-xs text-neutral-500">{showAdvanced ? "Hide" : "Show"}</span>
+              </button>
+              {showAdvanced && (
+                <div className="px-3.5 pb-3.5 space-y-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {MARKET_PARAM_FIELDS.map((f) => (
+                      <div key={f.key}>
+                        <label className="block text-xs text-neutral-500 mb-1">{f.label}</label>
+                        <input
+                          type="number"
+                          step={f.step}
+                          min={f.min}
+                          max={f.max}
+                          value={mcParamText[f.key]}
+                          onChange={(e) => handleParamChange(f.key, e.target.value)}
+                          className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-xs text-neutral-500">
+                    These are stylised defaults, not calibrated to one specific market — set them to match the market
+                    you are modelling. Volatility multipliers are normalised so your std stays the long-run average;
+                    the correlation matrix you entered is the Calm/Normal correlation, and positive correlations rise
+                    toward 1 in Stress by the boost shown. The risk-premium direction uses the link strength × 0.3,
+                    because that effect is empirically much weaker than the leverage effect.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className={`flex flex-wrap items-center gap-2 ${mcRunning && mcBigRun ? "mb-3" : "mb-5"}`}>
+          <button
+            onClick={handleRunMonteCarlo}
+            disabled={mcRunning}
+            className="flex items-center gap-1.5 text-sm bg-neutral-100 hover:bg-white disabled:opacity-60 text-black font-medium px-3.5 py-2 rounded-md transition-colors"
+          >
+            {mcRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Dices className="w-4 h-4" />}
+            {mcRunning ? "Running..." : mcOutput ? "Re-run simulation" : "Run simulation"}
+          </button>
+          {mcRunning && mcBigRun && (
+            <button
+              onClick={handleStopMonteCarlo}
+              className="flex items-center gap-1.5 text-sm text-neutral-300 border border-neutral-700 hover:bg-neutral-800 px-3.5 py-2 rounded-md transition-colors"
+            >
+              <X className="w-3.5 h-3.5" />
+              Stop
+            </button>
+          )}
+        </div>
+        {mcRunning && mcBigRun && (
+          <div className="mb-5">
+            <div className="flex justify-between text-xs text-neutral-500 mb-1 font-mono">
+              <span>{mcProgress >= 1 ? "Calculating statistics..." : `${Math.round(mcProgress * 100)}% of runs`}</span>
+              <span>{mcElapsed.toFixed(0)}s</span>
+            </div>
+            <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden">
+              <div className="h-full rounded-full bg-neutral-100" style={{ width: `${Math.min(100, mcProgress * 100)}%` }} />
+            </div>
+          </div>
+        )}
 
         {mcOutput && (
-          <div className="space-y-4 anim-in">
-            <ResponsiveContainer width="100%" height={280}>
-              <ComposedChart data={mcOutput.bands} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-                <defs>
-                  <linearGradient id="mcBand" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#818cf8" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="#818cf8" stopOpacity={0.05} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                <XAxis dataKey="month" tick={{ fontSize: 10, fill: "#94a3b8" }} interval="preserveStartEnd" />
-                <YAxis
-                  tick={{ fontSize: 10, fill: "#94a3b8" }}
-                  width={56}
-                  tickFormatter={(v) => `₹${Math.round(v / 1000)}k`}
-                />
-                <Tooltip
-                  labelFormatter={(label) => `Month: ${label}`}
-                  formatter={(v, name) => [`₹${Math.round(v).toLocaleString("en-IN")}`, name]}
-                  itemStyle={{ color: "#e2e8f0" }}
-                  labelStyle={{ color: "#e2e8f0", fontWeight: 600 }}
-                  contentStyle={{
-                    backgroundColor: "#0f172a",
-                    border: "1px solid #1e293b",
-                    borderRadius: 8,
-                    fontSize: 12,
-                  }}
-                />
-                <Area
-                  dataKey={(d) => [d.p10, d.p90]}
-                  name="10th–90th percentile"
-                  stroke="none"
-                  fill="url(#mcBand)"
-                  isAnimationActive={true}
-                  animationDuration={800}
-                />
-                <Line
-                  dataKey="p50"
-                  name="Median projection"
-                  stroke="#2dd4bf"
-                  strokeWidth={2.5}
-                  dot={false}
-                  isAnimationActive={true}
-                  animationDuration={900}
-                />
-                <ReferenceLine
-                  y={amount}
-                  stroke="#94a3b8"
-                  strokeDasharray="4 4"
-                  label={{ value: "Invested amount", position: "insideBottomRight", fill: "#94a3b8", fontSize: 10 }}
-                />
-                <ReferenceLine
-                  y={mcOutput.targetValue}
-                  stroke="#fbbf24"
-                  strokeDasharray="4 4"
-                  label={{ value: `+${mcTargetPct}% target`, position: "insideTopRight", fill: "#fbbf24", fontSize: 10 }}
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
+          <div className="space-y-5 anim-in">
+            {/* Key outcome stats */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <StatBox label="Median outcome" value={fmtINR(mcOutput.stats.median)} />
+              <StatBox label="Mean outcome" value={fmtINR(mcOutput.stats.mean)} />
+              <StatBox
+                label="Median annualized return"
+                value={fmtPct(mcOutput.stats.medianAnnualized, 2)}
+                tone={mcOutput.stats.medianAnnualized >= 0 ? "text-white" : "text-neutral-400"}
+              />
+              <StatBox label="Chance of loss" value={fmtPct(mcOutput.stats.probLoss)} />
+            </div>
 
+            {/* Percentile fan */}
             <div>
-              <h3 className="text-xs font-semibold text-slate-300 mb-1">Simulated paths</h3>
-              <p className="text-xs text-slate-500 mb-2">
-                Each faint line is one simulated future, generated from every holding's own return, volatility, and
-                correlation with the others (Cholesky-correlated GBM) — showing {mcOutput.samplePaths.length} of{" "}
-                {mcSimCount.toLocaleString("en-IN")} runs for legibility.
+              <h3 className="text-xs font-semibold text-neutral-300 mb-1">Portfolio value over time</h3>
+              <p className="text-xs text-neutral-500 mb-2">
+                Median path with the 25th–75th and 5th–95th percentile bands across{" "}
+                {mcOutput.simCount > mcOutput.bandSampleSize
+                  ? `the first ${mcOutput.bandSampleSize.toLocaleString("en-IN")}`
+                  : "all"}{" "}
+                simulations.
+              </p>
+              <ResponsiveContainer width="100%" height={280}>
+                <ComposedChart data={mcOutput.bands} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                  <defs>
+                    <linearGradient id="mcBandOuter" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#d4d4d4" stopOpacity={0.22} />
+                      <stop offset="100%" stopColor="#d4d4d4" stopOpacity={0.04} />
+                    </linearGradient>
+                    <linearGradient id="mcBandInner" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#d4d4d4" stopOpacity={0.45} />
+                      <stop offset="100%" stopColor="#d4d4d4" stopOpacity={0.12} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
+                  <XAxis dataKey="month" tick={{ fontSize: 12, fill: "#a3a3a3" }} interval="preserveStartEnd" />
+                  <YAxis tick={{ fontSize: 12, fill: "#a3a3a3" }} width={60} tickFormatter={fmtINRCompact} />
+                  <Tooltip
+                    labelFormatter={(label) => `Month: ${label}`}
+                    formatter={(v, name) => [
+                      Array.isArray(v) ? `${fmtINR(v[0])} – ${fmtINR(v[1])}` : fmtINR(v),
+                      name,
+                    ]}
+                    itemStyle={{ color: "#e5e5e5" }}
+                    labelStyle={{ color: "#e5e5e5", fontWeight: 600 }}
+                    contentStyle={TOOLTIP_STYLE}
+                  />
+                  <Area
+                    dataKey="range90"
+                    name="5th–95th percentile"
+                    stroke="none"
+                    fill="url(#mcBandOuter)"
+                    isAnimationActive={true}
+                    animationDuration={800}
+                  />
+                  <Area
+                    dataKey="range50"
+                    name="25th–75th percentile"
+                    stroke="none"
+                    fill="url(#mcBandInner)"
+                    isAnimationActive={true}
+                    animationDuration={800}
+                  />
+                  <Line
+                    dataKey="p50"
+                    name="Median"
+                    stroke="#fafafa"
+                    strokeWidth={2.5}
+                    dot={false}
+                    isAnimationActive={true}
+                    animationDuration={900}
+                  />
+                  <ReferenceLine
+                    y={amount}
+                    stroke="#a3a3a3"
+                    strokeDasharray="4 4"
+                    label={{ value: "Invested amount", position: "insideBottomRight", fill: "#a3a3a3", fontSize: 13 }}
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Market conditions (dynamic model only) */}
+            {mcOutput.model === "dynamic" && conditionData.length > 0 && (
+              <div>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <h3 className="text-xs font-semibold text-neutral-300">Market conditions (one simulated path)</h3>
+                  <button
+                    onClick={() => setCondIdx((i) => (i + 1) % mcOutput.conditionTracks.length)}
+                    className="text-xs text-neutral-300 border border-neutral-700 hover:bg-neutral-800 px-2.5 py-1 rounded-md transition-colors"
+                  >
+                    Show another path ({(condIdx % mcOutput.conditionTracks.length) + 1}/
+                    {mcOutput.conditionTracks.length})
+                  </button>
+                </div>
+                <p className="text-xs text-neutral-500 mb-2">
+                  In this future the portfolio&apos;s std (grey line) moves above and below your input (dashed line),
+                  driven by the market regime and each holding&apos;s own volatility, while its expected return (white
+                  line) responds according to the &quot;Return vs volatility&quot; setting. Hover a point to see that
+                  month&apos;s regime.
+                </p>
+                <ResponsiveContainer width="100%" height={230}>
+                  <ComposedChart data={conditionData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
+                    <XAxis dataKey="month" tick={{ fontSize: 12, fill: "#a3a3a3" }} interval="preserveStartEnd" />
+                    <YAxis tick={{ fontSize: 12, fill: "#a3a3a3" }} width={44} unit="%" />
+                    <Tooltip
+                      labelFormatter={(label, payload) =>
+                        `${label} · ${payload && payload[0] ? payload[0].payload.regime : ""} regime`
+                      }
+                      formatter={(v, name) => [`${Number(v).toFixed(1)}%`, name]}
+                      itemStyle={{ color: "#e5e5e5" }}
+                      labelStyle={{ color: "#e5e5e5", fontWeight: 600 }}
+                      contentStyle={{
+                        backgroundColor: "#0a0a0a",
+                        border: "1px solid #262626",
+                        borderRadius: 8,
+                        fontSize: 14,
+                      }}
+                    />
+                    <Legend iconType="plainline" wrapperStyle={{ fontSize: 13, color: "#a3a3a3" }} />
+                    <ReferenceLine y={0} stroke="#525252" />
+                    <ReferenceLine y={mcOutput.basePortVol * 100} stroke="#a3a3a3" strokeDasharray="4 4" strokeOpacity={0.6} />
+                    <Line
+                      dataKey="std"
+                      name="Std (annualized)"
+                      stroke="#a3a3a3"
+                      strokeWidth={2}
+                      dot={false}
+                      isAnimationActive={false}
+                    />
+                    <Line
+                      dataKey="ret"
+                      name="Expected return (annualized)"
+                      stroke="#fafafa"
+                      strokeWidth={2}
+                      dot={false}
+                      isAnimationActive={false}
+                    />
+                  </ComposedChart>
+                </ResponsiveContainer>
+                {mcOutput.regimeShare && (
+                  <div className="grid grid-cols-3 gap-3 mt-3">
+                    {mcOutput.regimeShare.map((r) => (
+                      <StatBox
+                        key={r.label}
+                        label={`Time in ${r.label}`}
+                        value={fmtPct(r.share)}
+                        tone={r.label === "Stress" ? "text-neutral-400" : r.label === "Calm" ? "text-white" : "text-neutral-100"}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Simulated paths */}
+            <div>
+              <h3 className="text-xs font-semibold text-neutral-300 mb-1">Simulated paths</h3>
+              <p className="text-xs text-neutral-500 mb-2">
+                Each line is one simulated future, drawn in its own colour, generated from every holding's own return,
+                volatility, and correlation with the others — showing {mcOutput.samplePaths.length} of{" "}
+                {mcOutput.simCount.toLocaleString("en-IN")} runs for legibility.
               </p>
               <ResponsiveContainer width="100%" height={220}>
                 <LineChart data={spaghettiData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                  <XAxis dataKey="month" tick={{ fontSize: 10, fill: "#94a3b8" }} interval="preserveStartEnd" />
+                  <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
+                  <XAxis dataKey="month" tick={{ fontSize: 12, fill: "#a3a3a3" }} interval="preserveStartEnd" />
                   <YAxis
-                    tick={{ fontSize: 10, fill: "#94a3b8" }}
-                    width={56}
-                    tickFormatter={(v) => `₹${Math.round(v / 1000)}k`}
+                    tick={{ fontSize: 12, fill: "#a3a3a3" }}
+                    width={60}
+                    tickFormatter={fmtINRCompact}
+                    domain={["auto", "auto"]}
                   />
-                  <ReferenceLine y={amount} stroke="#94a3b8" strokeDasharray="4 4" />
+                  <ReferenceLine y={amount} stroke="#e5e5e5" strokeDasharray="4 4" />
                   {mcOutput.samplePaths.map((_, idx) => (
                     <Line
                       key={idx}
                       dataKey={`sim${idx}`}
-                      stroke="#818cf8"
-                      strokeWidth={1}
+                      stroke={PATH_COLORS[idx % PATH_COLORS.length]}
+                      strokeWidth={1.4}
                       dot={false}
                       isAnimationActive={false}
-                      strokeOpacity={0.22}
+                      strokeOpacity={0.85}
                     />
                   ))}
                 </LineChart>
               </ResponsiveContainer>
             </div>
 
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-              <div className="rounded-lg border border-slate-800 px-3 py-2.5">
-                <p className="text-xs text-slate-500">Median outcome</p>
-                <p className="text-sm font-semibold text-slate-100 font-mono">
-                  ₹{Math.round(mcOutput.stats.median).toLocaleString("en-IN")}
-                </p>
-              </div>
-              <div className="rounded-lg border border-slate-800 px-3 py-2.5">
-                <p className="text-xs text-slate-500">Worst case (10th pct.)</p>
-                <p className="text-sm font-semibold text-rose-400 font-mono">
-                  ₹{Math.round(mcOutput.stats.p10).toLocaleString("en-IN")}
-                </p>
-              </div>
-              <div className="rounded-lg border border-slate-800 px-3 py-2.5">
-                <p className="text-xs text-slate-500">Best case (90th pct.)</p>
-                <p className="text-sm font-semibold text-emerald-400 font-mono">
-                  ₹{Math.round(mcOutput.stats.p90).toLocaleString("en-IN")}
-                </p>
-              </div>
-              <div className="rounded-lg border border-slate-800 px-3 py-2.5">
-                <p className="text-xs text-slate-500">Chance of loss</p>
-                <p className="text-sm font-semibold text-slate-100 font-mono">
-                  {(mcOutput.stats.probLoss * 100).toFixed(1)}%
-                </p>
-              </div>
+            {/* Distribution of final values */}
+            <div>
+              <h3 className="text-xs font-semibold text-neutral-300 mb-1">Distribution of final values</h3>
+              <p className="text-xs text-neutral-500 mb-2">
+                How often each ending value occurred across {mcOutput.simCount.toLocaleString("en-IN")} simulations
+                after {mcOutput.horizonLabel.toLowerCase()}. Red bars are outcomes below the amount invested.
+              </p>
+              <ResponsiveContainer width="100%" height={220}>
+                <BarChart data={mcOutput.histogram} margin={{ top: 4, right: 8, left: 0, bottom: 4 }} barCategoryGap={1}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
+                  <XAxis
+                    dataKey="mid"
+                    tick={{ fontSize: 12, fill: "#a3a3a3" }}
+                    tickFormatter={fmtINRCompact}
+                    interval="preserveStartEnd"
+                    minTickGap={28}
+                  />
+                  <YAxis
+                    tick={{ fontSize: 12, fill: "#a3a3a3" }}
+                    width={40}
+                    tickFormatter={(v) => `${Number(v).toFixed(0)}%`}
+                  />
+                  <Tooltip
+                    labelFormatter={(label) => `Around ${fmtINR(label)}`}
+                    formatter={(v) => [`${Number(v).toFixed(1)}%`, "Of simulations"]}
+                    cursor={{ fill: "#262626", opacity: 0.4 }}
+                    itemStyle={{ color: "#e5e5e5" }}
+                    labelStyle={{ color: "#e5e5e5", fontWeight: 600 }}
+                    contentStyle={TOOLTIP_STYLE}
+                  />
+                  <Bar dataKey="pct" isAnimationActive={true} animationDuration={800}>
+                    {mcOutput.histogram.map((b, i) => (
+                      <Cell key={i} fill={b.isLoss ? "#525252" : "#e5e5e5"} fillOpacity={0.85} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
 
-            <div className="rounded-lg border border-amber-900 bg-amber-950/30 px-3.5 py-2.5">
-              <p className="text-xs text-slate-300">
-                Probability of reaching <span className="font-mono text-amber-400">+{mcTargetPct}%</span> (₹
-                {Math.round(mcOutput.targetValue).toLocaleString("en-IN")}) within {mcOutput.horizonLabel.toLowerCase()}:{" "}
-                <span className="font-mono text-amber-400">{(mcOutput.probTarget * 100).toFixed(1)}%</span> of
-                simulated paths.
+            {/* Percentile table */}
+            <div>
+              <h3 className="text-xs font-semibold text-neutral-300 mb-2">Outcome percentiles</h3>
+              <div className="overflow-x-auto rounded-lg border border-neutral-800">
+                <table className="w-full text-xs min-w-[320px]">
+                  <thead>
+                    <tr className="text-left text-neutral-500 border-b border-neutral-800">
+                      <th className="px-3 py-2 font-medium">Percentile</th>
+                      <th className="px-3 py-2 font-medium">Portfolio value</th>
+                      <th className="px-3 py-2 font-medium">Return</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {mcOutput.percentiles.map((row) => (
+                      <tr key={row.p} className="border-b border-neutral-800/60 last:border-0">
+                        <td className="px-3 py-2 text-neutral-400 font-mono">{row.p}th</td>
+                        <td className="px-3 py-2 text-neutral-200 font-mono">{fmtINR(row.value)}</td>
+                        <td
+                          className={`px-3 py-2 font-mono ${row.ret >= 0 ? "text-white" : "text-neutral-400"}`}
+                        >
+                          {row.ret >= 0 ? "+" : ""}
+                          {fmtPct(row.ret)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-[13px] text-neutral-600 mt-1.5">
+                The 5th percentile means 5% of simulations ended at or below that value.
               </p>
             </div>
 
+            {/* Risk measures */}
             <div>
-              <h3 className="text-xs font-semibold text-slate-300 mb-1">Per-instrument worst case</h3>
-              <p className="text-xs text-slate-500 mb-2">
-                For each holding, using its own volatility: the simulated 5th-percentile outcome from the paths above,
-                and an analytical worst case (95% confidence, lognormal) computed directly from that instrument's own
-                return and std.
+              <h3 className="text-xs font-semibold text-neutral-300 mb-2">Risk measures</h3>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                <StatBox
+                  label="VaR (95%)"
+                  value={fmtINR(mcOutput.stats.var95)}
+                  tone="text-neutral-400"
+                  hint="Loss not exceeded in 95% of runs"
+                />
+                <StatBox
+                  label="CVaR (95%)"
+                  value={fmtINR(mcOutput.stats.cvar95)}
+                  tone="text-neutral-400"
+                  hint="Average loss in the worst 5%"
+                />
+                <StatBox
+                  label="Median max drawdown"
+                  value={fmtPct(mcOutput.stats.medianDrawdown)}
+                  tone="text-neutral-300"
+                  hint="Typical peak-to-trough fall"
+                />
+                <StatBox
+                  label="Bad-luck drawdown (5th pct.)"
+                  value={fmtPct(mcOutput.stats.worstDrawdown)}
+                  tone="text-neutral-400"
+                  hint="Deeper than 95% of runs"
+                />
+              </div>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mt-3">
+                <StatBox label="Worst simulated run" value={fmtINR(mcOutput.stats.worst)} tone="text-neutral-400" />
+                <StatBox label="Best simulated run" value={fmtINR(mcOutput.stats.best)} tone="text-white" />
+                <StatBox label="Std dev of outcomes" value={fmtINR(mcOutput.stats.std)} />
+                <StatBox label="Runs" value={mcOutput.simCount.toLocaleString("en-IN")} />
+              </div>
+            </div>
+
+            {/* Per-instrument worst case */}
+            <div>
+              <h3 className="text-xs font-semibold text-neutral-300 mb-1">Per-instrument worst case</h3>
+              <p className="text-xs text-neutral-500 mb-2">
+                Each holding on its own (buy-and-hold, no rebalancing): the simulated 5th-percentile outcome under the
+                selected market model, next to the constant-volatility formula (95% confidence, lognormal) from that
+                holding&apos;s own return and std. Both are for the same position, so any gap is the effect of regimes and
+                time-varying volatility (fatter tails), not of rebalancing.
               </p>
               <div className="space-y-2">
                 {mcOutput.instrumentStats.map((s, i) => (
                   <div
                     key={s.name}
-                    className="flex items-center justify-between gap-3 text-sm rounded-lg border border-slate-800 px-3 py-2.5"
+                    className="flex items-center justify-between gap-3 text-sm rounded-lg border border-neutral-800 px-3 py-2.5"
                   >
                     <span className="flex items-center gap-2 min-w-0">
                       <span
                         className="h-2 w-2 rounded-full shrink-0"
                         style={{ backgroundColor: SERIES_COLORS[i % SERIES_COLORS.length] }}
                       />
-                      <span className="truncate text-slate-200">{s.name}</span>
+                      <span className="truncate text-neutral-200">{s.name}</span>
                     </span>
                     <div className="text-right font-mono text-xs shrink-0">
-                      <div className="text-rose-400">
-                        ₹{Math.round(s.simulatedWorst).toLocaleString("en-IN")} ({s.worstPct.toFixed(1)}%)
+                      <div className="text-neutral-400">
+                        {fmtINR(s.simulatedWorst)} ({s.worstPct.toFixed(1)}%)
                       </div>
-                      <div className="text-slate-600">
-                        analytical: ₹{Math.round(s.analyticalWorst).toLocaleString("en-IN")}
-                      </div>
+                      <div className="text-neutral-600">constant-vol formula: {fmtINR(s.analyticalWorst)}</div>
                     </div>
                   </div>
                 ))}
               </div>
             </div>
 
-            <p className="text-xs text-slate-600">
-              Based on {mcSimCount.toLocaleString("en-IN")} simulated paths, each built by simulating every holding
-              separately from its own return and volatility with their mutual correlations preserved (not just the
-              portfolio's blended return/volatility). This is a probabilistic projection, not a guarantee — actual
-              results can fall outside the shown band.
+            <p className="text-xs text-neutral-600">
+              Based on {mcOutput.simCount.toLocaleString("en-IN")} simulated paths ({mcOutput.model === "dynamic"
+                ? "dynamic model: regimes, time-varying market and per-holding volatility, return linked to volatility, higher correlation in stress"
+                : "constant return and std"}), each built by simulating every holding separately with their mutual
+              correlations preserved (Calm/Normal correlation as entered). Long-run average return and std are kept close to the values you entered. This is a
+              probabilistic projection, not a guarantee — actual results can fall outside the shown bands.
             </p>
           </div>
         )}
@@ -1692,7 +2584,7 @@ function ResultScreen({ result, amount, chartData, onBack }) {
 
       <button
         onClick={onBack}
-        className="flex items-center gap-1.5 text-sm text-slate-300 border border-slate-700 hover:bg-slate-900 px-3.5 py-2 rounded-md transition-colors"
+        className="flex items-center gap-1.5 text-sm text-neutral-300 border border-neutral-700 hover:bg-neutral-900 px-3.5 py-2 rounded-md transition-colors"
       >
         <ArrowLeft className="w-4 h-4" />
         Back
@@ -1703,13 +2595,13 @@ function ResultScreen({ result, amount, chartData, onBack }) {
 
 function MetricCard({ icon, label, value, subValue, delay = 0 }) {
   return (
-    <div className="rounded-xl border border-slate-800 bg-slate-900/60 px-3.5 py-3 anim-in" style={{ animationDelay: `${delay}ms` }}>
+    <div className="rounded-xl border border-neutral-800 bg-neutral-900/60 px-3.5 py-3 anim-in" style={{ animationDelay: `${delay}ms` }}>
       <div className="flex items-center gap-1.5 mb-1">
         {icon}
-        <p className="text-xs text-slate-500">{label}</p>
+        <p className="text-xs text-neutral-500">{label}</p>
       </div>
-      <p className="text-lg font-semibold text-slate-100 font-mono">{value}</p>
-      {subValue && <p className="text-xs text-slate-500 font-mono mt-0.5">{subValue}</p>}
+      <p className="text-lg font-semibold text-neutral-100 font-mono">{value}</p>
+      {subValue && <p className="text-xs text-neutral-500 font-mono mt-0.5">{subValue}</p>}
     </div>
   );
 }
