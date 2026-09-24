@@ -17,6 +17,11 @@ import {
   Pencil,
   Save,
   X,
+  Database,
+  Upload,
+  FileText,
+  Shuffle,
+  Square,
 } from "lucide-react";
 import {
   BarChart,
@@ -35,6 +40,9 @@ import {
   Line,
   LineChart,
   ReferenceLine,
+  ScatterChart,
+  Scatter,
+  ZAxis,
 } from "recharts";
 
 const REBALANCE_FREQUENCY_OPTIONS = [
@@ -48,6 +56,26 @@ const MC_HORIZON_OPTIONS = [
   { value: "1", label: "1 Year", years: 1 },
   { value: "3", label: "3 Years", years: 3 },
   { value: "5", label: "5 Years", years: 5 },
+];
+
+const HISTORY_HORIZON_OPTIONS = [
+  { value: "1", label: "1 Year", years: 1 },
+  { value: "3", label: "3 Years", years: 3 },
+  { value: "5", label: "5 Years", years: 5 },
+];
+
+const HISTORY_WINDOW_OPTIONS = [
+  { value: "0", label: "All shared history", years: 0 },
+  { value: "5", label: "Last 5 years", years: 5 },
+  { value: "3", label: "Last 3 years", years: 3 },
+  { value: "2", label: "Last 2 years", years: 2 },
+];
+
+const HISTORY_BLOCK_OPTIONS = [
+  { value: "1", label: "1 month (independent months)" },
+  { value: "3", label: "3 months" },
+  { value: "6", label: "6 months" },
+  { value: "12", label: "12 months" },
 ];
 
 const MC_SIM_COUNT_OPTIONS = [200, 500, 1000, 5000, 50000, 100000, 1000000];
@@ -332,6 +360,12 @@ const PATH_COLORS = Array.from(
     }%)`
 );
 
+// One clearly different colour per individual holding, for charts (like the
+// historical backtest) that plot each holding's own line alongside the
+// portfolio lines. Up to 5 holdings, chosen to stay visible against a dark
+// background and distinct from each other.
+const ASSET_LINE_COLORS = ["#f97316", "#38bdf8", "#facc15", "#f472b6", "#4ade80"];
+
 // --- FORMAT HELPERS -----------------------------------------------------
 function fmtINR(v) {
   return `₹${Math.round(v).toLocaleString("en-IN")}`;
@@ -363,12 +397,25 @@ function pairKeyById(idA, idB) {
 const DEFAULT_CORRELATION = 0;
 
 // Correlation for a pair of products: the value the user entered in the
-// matrix if there is one, otherwise DEFAULT_CORRELATION.
+// matrix if there is one; otherwise, if both products come with price
+// history, the correlation measured from that history; otherwise
+// DEFAULT_CORRELATION.
 function getCorrelation(pA, pB, overrides = {}) {
   if (pA.id === pB.id) return 1;
   const key = pairKeyById(pA.id, pB.id);
   if (overrides[key] !== undefined) return overrides[key];
+  if (pA.history && pB.history) {
+    const measured = historicalCorrelation(pA.history, pB.history);
+    if (measured !== null) return Math.round(measured * 1000) / 1000;
+  }
   return DEFAULT_CORRELATION;
+}
+
+// Where a pair's correlation comes from: "manual", "data" or "default".
+function correlationSource(pA, pB, overrides = {}) {
+  if (overrides[pairKeyById(pA.id, pB.id)] !== undefined) return "manual";
+  if (pA.history && pB.history && historicalCorrelation(pA.history, pB.history) !== null) return "data";
+  return "default";
 }
 
 function buildCovMatrix(selected, overrides = {}) {
@@ -1010,6 +1057,833 @@ function runMonteCarloSimulation(args) {
   return job.finish();
 }
 
+// --- HISTORICAL DATA ------------------------------------------------------
+// Everything for instruments that come with real price history: reading a
+// price-history CSV (Investing.com / Yahoo style: Date + Price or Close),
+// measuring return, std and correlation from it, re-sampling the real
+// history into many possible futures ("historical simulation"), searching
+// for the best allocation in those futures, and back-testing on the actual
+// past.
+const MIN_HISTORY_POINTS = 30;
+const MS_PER_DAY = 86400000;
+const MONTH_ABBR = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+function dayNumber(y, m, d) {
+  return Math.round(Date.UTC(y, m - 1, d) / MS_PER_DAY);
+}
+
+function dayToIso(day) {
+  return new Date(day * MS_PER_DAY).toISOString().slice(0, 10);
+}
+
+function isoToLabel(iso) {
+  const [y, m, d] = iso.split("-");
+  return `${d} ${MONTH_ABBR[Number(m) - 1][0].toUpperCase()}${MONTH_ABBR[Number(m) - 1].slice(1)} ${y}`;
+}
+
+function validYmd(y, m, d) {
+  if (!(y >= 1900 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31)) return false;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+function monthFromName(name) {
+  const idx = MONTH_ABBR.indexOf(String(name).slice(0, 3).toLowerCase());
+  return idx >= 0 ? idx + 1 : 0;
+}
+
+// Splits CSV text into rows of fields (handles quoted fields, thousands
+// separators inside quotes, and doubled quotes).
+function parseCsvText(text, delimiter) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else inQuotes = false;
+      } else field += ch;
+    } else if (ch === '"') inQuotes = true;
+    else if (ch === delimiter) {
+      row.push(field);
+      field = "";
+    } else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i += 1;
+      row.push(field);
+      field = "";
+      if (row.some((c) => c.trim() !== "")) rows.push(row);
+      row = [];
+    } else field += ch;
+  }
+  row.push(field);
+  if (row.some((c) => c.trim() !== "")) rows.push(row);
+  return rows;
+}
+
+function detectDelimiter(text) {
+  const firstLine = text.split(/\r?\n/).find((l) => l.trim() !== "") || "";
+  let best = ",";
+  let bestCount = 0;
+  for (const d of [",", ";", "\t"]) {
+    let count = 0;
+    let inQuotes = false;
+    for (const ch of firstLine) {
+      if (ch === '"') inQuotes = !inQuotes;
+      else if (ch === d && !inQuotes) count += 1;
+    }
+    if (count > bestCount) {
+      best = d;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+// "22,901.85" -> 22901.85, "1.234,56" -> 1234.56, "₹ 1,234" -> 1234
+function parseNumberToken(raw, decimalComma = false) {
+  if (raw === undefined || raw === null) return NaN;
+  let t = String(raw).trim().replace(/[\s₹$€£]/g, "");
+  if (t === "" || t === "-") return NaN;
+  const hasComma = t.includes(",");
+  const hasDot = t.includes(".");
+  if (hasComma && hasDot) {
+    if (t.lastIndexOf(",") > t.lastIndexOf(".")) t = t.replace(/\./g, "").replace(",", ".");
+    else t = t.replace(/,/g, "");
+  } else if (hasComma) {
+    if (decimalComma) t = t.replace(",", ".");
+    else if (/^-?\d{1,3}(,\d{3})+$/.test(t)) t = t.replace(/,/g, "");
+    else t = t.replace(",", ".");
+  }
+  const v = Number(t);
+  return Number.isFinite(v) ? v : NaN;
+}
+
+// Reads one date cell. Numeric day/month dates (12/03/2024) are returned as
+// "ab" and resolved for the whole file at once, because they are ambiguous.
+function parseDateCell(raw) {
+  const t = String(raw === undefined || raw === null ? "" : raw).trim();
+  let m = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T\s].*)?$/.exec(t);
+  if (m) return { kind: "ymd", y: +m[1], m: +m[2], d: +m[3] };
+  m = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})(?:\s.*)?$/.exec(t);
+  if (m) return { kind: "ab", a: +m[1], b: +m[2], y: +m[3] };
+  m = /^(\d{1,2})[-\s]([A-Za-z]{3,9})\.?[-\s,]+(\d{4})$/.exec(t);
+  if (m && monthFromName(m[2])) return { kind: "ymd", y: +m[3], m: monthFromName(m[2]), d: +m[1] };
+  m = /^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$/.exec(t);
+  if (m && monthFromName(m[1])) return { kind: "ymd", y: +m[3], m: monthFromName(m[1]), d: +m[2] };
+  return null;
+}
+
+// How many times a sequence of day numbers reverses direction (0 = perfectly
+// ordered either way). Used to tell 03/04/2024 = 3 April from 4 March.
+function orderViolations(days) {
+  let up = 0;
+  let down = 0;
+  for (let i = 1; i < days.length; i++) {
+    if (days[i] > days[i - 1]) up += 1;
+    else if (days[i] < days[i - 1]) down += 1;
+  }
+  return Math.min(up, down);
+}
+
+// Return, std and drawdown measured from a price history. Return is the
+// GBM drift (mean log return + half the variance), which is the "return"
+// convention the simulator uses; CAGR is the plain compound annual rate.
+function computeSeriesStats(days, prices) {
+  const n = prices.length - 1;
+  let sum = 0;
+  const logs = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    logs[i] = Math.log(prices[i + 1] / prices[i]);
+    sum += logs[i];
+  }
+  const mean = sum / n;
+  let ss = 0;
+  for (let i = 0; i < n; i++) ss += (logs[i] - mean) ** 2;
+  const sd = Math.sqrt(ss / Math.max(1, n - 1));
+  const spanYears = Math.max((days[days.length - 1] - days[0]) / 365.25, 1e-6);
+  const perYear = n / spanYears;
+  const sigma = sd * Math.sqrt(perYear);
+  const muLog = mean * perYear;
+  let peak = prices[0];
+  let maxDrawdown = 0;
+  for (let i = 0; i < prices.length; i++) {
+    if (prices[i] > peak) peak = prices[i];
+    maxDrawdown = Math.min(maxDrawdown, prices[i] / peak - 1);
+  }
+  return {
+    points: prices.length,
+    startIso: dayToIso(days[0]),
+    endIso: dayToIso(days[days.length - 1]),
+    spanYears,
+    perYear,
+    cagr: Math.exp(muLog) - 1,
+    mu: muLog + 0.5 * sigma * sigma,
+    sigma,
+    maxDrawdown,
+  };
+}
+
+// Reads a price-history CSV. Returns { ok: false, error } or
+// { ok: true, days, dates, prices, stats, warnings, ... }.
+function parseHistoricalCsv(rawText) {
+  const warnings = [];
+  const text = String(rawText || "").replace(/^\uFEFF/, "").trim();
+  if (!text) return { ok: false, empty: true, error: "No data yet." };
+  const delimiter = detectDelimiter(text);
+  const rows = parseCsvText(text, delimiter);
+  if (rows.length < 2) return { ok: false, error: "The data needs a header row and at least one row of prices." };
+
+  const norm = (v) => String(v).trim().toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+  const header = rows[0].map(norm);
+  let dateCol = header.findIndex((h) => h.includes("date") || h === "time" || h === "day" || h === "timestamp");
+  let priceCol = -1;
+  for (const key of ["price", "adj close", "adjclose", "close", "nav", "value", "last"]) {
+    const idx = header.findIndex((h) => h === key);
+    if (idx >= 0) {
+      priceCol = idx;
+      break;
+    }
+  }
+  if (priceCol < 0) priceCol = header.findIndex((h) => h.includes("close") || h.includes("price"));
+  let startRow = 1;
+  const decimalComma = delimiter === ";";
+  if (dateCol < 0 || priceCol < 0) {
+    if (parseDateCell(rows[0][0]) && Number.isFinite(parseNumberToken(rows[0][1], decimalComma))) {
+      dateCol = 0;
+      priceCol = 1;
+      startRow = 0;
+      warnings.push("No header row found: reading column 1 as the date and column 2 as the price.");
+    } else {
+      return { ok: false, error: 'Could not find a "Date" column and a "Price" (or "Close") column in the header row.' };
+    }
+  }
+
+  const raw = [];
+  let skipped = 0;
+  for (let r = startRow; r < rows.length; r++) {
+    const parts = parseDateCell(rows[r][dateCol]);
+    const price = parseNumberToken(rows[r][priceCol], decimalComma);
+    if (!parts || !(price > 0)) {
+      skipped += 1;
+      continue;
+    }
+    raw.push({ parts, price });
+  }
+  if (raw.length < MIN_HISTORY_POINTS) {
+    return {
+      ok: false,
+      error: `Only ${raw.length} usable rows were found (at least ${MIN_HISTORY_POINTS} are needed). Check that the Date and Price columns are filled in.`,
+    };
+  }
+
+  // Numeric a/b/year dates: decide day-first or month-first for the whole file.
+  let dateFormat = "ISO / named month";
+  const ab = raw.filter((x) => x.parts.kind === "ab");
+  if (ab.length > 0) {
+    const aOver = ab.some((x) => x.parts.a > 12);
+    const bOver = ab.some((x) => x.parts.b > 12);
+    let dayFirst;
+    if (aOver && !bOver) dayFirst = true;
+    else if (bOver && !aOver) dayFirst = false;
+    else if (aOver && bOver) return { ok: false, error: "The dates mix day-first and month-first formats. Please use one format." };
+    else {
+      const asDmy = ab.map((x) => (validYmd(x.parts.y, x.parts.b, x.parts.a) ? dayNumber(x.parts.y, x.parts.b, x.parts.a) : 0));
+      const asMdy = ab.map((x) => (validYmd(x.parts.y, x.parts.a, x.parts.b) ? dayNumber(x.parts.y, x.parts.a, x.parts.b) : 0));
+      const dmy = orderViolations(asDmy);
+      const mdy = orderViolations(asMdy);
+      dayFirst = dmy < mdy;
+      if (dmy === mdy) warnings.push("Dates like 03/04/2024 were read as month/day/year. If they are day/month/year, edit the file so a day above 12 appears, or use YYYY-MM-DD.");
+    }
+    dateFormat = dayFirst ? "DD/MM/YYYY" : "MM/DD/YYYY";
+    for (const x of ab) {
+      x.parts = dayFirst ? { kind: "ymd", y: x.parts.y, m: x.parts.b, d: x.parts.a } : { kind: "ymd", y: x.parts.y, m: x.parts.a, d: x.parts.b };
+    }
+  }
+
+  const byDay = new Map();
+  let duplicates = 0;
+  for (const x of raw) {
+    const { y, m, d } = x.parts;
+    if (!validYmd(y, m, d)) {
+      skipped += 1;
+      continue;
+    }
+    const day = dayNumber(y, m, d);
+    if (byDay.has(day)) duplicates += 1;
+    byDay.set(day, x.price);
+  }
+  const days = Array.from(byDay.keys()).sort((a, b) => a - b);
+  if (days.length < MIN_HISTORY_POINTS) {
+    return { ok: false, error: `Only ${days.length} distinct dates were found (at least ${MIN_HISTORY_POINTS} are needed).` };
+  }
+  const prices = days.map((d) => byDay.get(d));
+
+  if (skipped > 0) warnings.push(`${skipped} row${skipped === 1 ? "" : "s"} skipped (missing or unreadable date/price).`);
+  if (duplicates > 0) warnings.push(`${duplicates} duplicate date${duplicates === 1 ? "" : "s"} found; the last value for each date was used.`);
+
+  const gaps = [];
+  for (let i = 1; i < days.length; i++) gaps.push(days[i] - days[i - 1]);
+  const medianGap = [...gaps].sort((a, b) => a - b)[Math.floor(gaps.length / 2)];
+  const bigGapLimit = Math.max(10, 6 * medianGap);
+  const bigGaps = gaps.filter((g) => g > bigGapLimit);
+  if (bigGaps.length > 0) {
+    warnings.push(`${bigGaps.length} gap${bigGaps.length === 1 ? "" : "s"} longer than ${bigGapLimit} days (largest ${Math.max(...bigGaps)} days): missing data counts as one long move.`);
+  }
+  let jumps = 0;
+  for (let i = 1; i < prices.length; i++) if (Math.abs(Math.log(prices[i] / prices[i - 1])) > 0.25) jumps += 1;
+  if (jumps > 0) warnings.push(`${jumps} move${jumps === 1 ? "" : "s"} larger than 25% in one period: check for stock splits or bad rows.`);
+
+  const stats = computeSeriesStats(days, prices);
+  if (stats.spanYears < 2) warnings.push("Less than 2 years of history: return and risk estimates will be unreliable.");
+  else if (stats.perYear > 100 && stats.points < 250) warnings.push("Fewer than 250 daily prices: estimates will be noisy.");
+
+  return {
+    ok: true,
+    days,
+    dates: days.map(dayToIso),
+    prices,
+    rowsRead: rows.length - startRow,
+    skipped,
+    dateFormat,
+    warnings,
+    stats,
+  };
+}
+
+function guessNameFromFile(fileName) {
+  return String(fileName || "")
+    .replace(/\.[a-z0-9]+$/i, "")
+    .replace(/[_\-]+/g, " ")
+    .replace(/\(\d+\)/g, " ")
+    .replace(/historical\s*data|price\s*history|history|prices?/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\s+\d$/, "");
+}
+
+function pearsonCorrelation(xs, ys) {
+  const n = xs.length;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < n; i++) {
+    mx += xs[i];
+    my += ys[i];
+  }
+  mx /= n;
+  my /= n;
+  let sxy = 0;
+  let sxx = 0;
+  let syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - mx;
+    const dy = ys[i] - my;
+    sxy += dx * dy;
+    sxx += dx * dx;
+    syy += dy * dy;
+  }
+  if (sxx <= 0 || syy <= 0) return 0;
+  return Math.max(-1, Math.min(1, sxy / Math.sqrt(sxx * syy)));
+}
+
+// Correlation measured from two price histories, using the dates they share.
+const historyCorrelationCache = new WeakMap();
+function historicalCorrelation(hA, hB) {
+  let inner = historyCorrelationCache.get(hA);
+  if (!inner) {
+    inner = new WeakMap();
+    historyCorrelationCache.set(hA, inner);
+  }
+  if (inner.has(hB)) return inner.get(hB);
+  const a = hA.days;
+  const b = hB.days;
+  const lrA = [];
+  const lrB = [];
+  let i = 0;
+  let j = 0;
+  let prevA = null;
+  let prevB = null;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      if (prevA !== null) {
+        lrA.push(Math.log(hA.prices[i] / prevA));
+        lrB.push(Math.log(hB.prices[j] / prevB));
+      }
+      prevA = hA.prices[i];
+      prevB = hB.prices[j];
+      i += 1;
+      j += 1;
+    } else if (a[i] < b[j]) i += 1;
+    else j += 1;
+  }
+  const value = lrA.length >= 20 ? pearsonCorrelation(lrA, lrB) : null;
+  inner.set(hB, value);
+  return value;
+}
+
+function intersectSorted(a, b) {
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      out.push(a[i]);
+      i += 1;
+      j += 1;
+    } else if (a[i] < b[j]) i += 1;
+    else j += 1;
+  }
+  return out;
+}
+
+// The real, aligned history of the chosen instruments: log returns between
+// consecutive dates that ALL of the instruments WITH uploaded data traded,
+// plus running sums so that the growth over any stretch of days can be read
+// off instantly. A holding with no uploaded history contributes no dates of
+// its own -- instead it is given a FIXED log return every single day, sized
+// from its manual return field, with zero variance (so it never adds risk
+// or correlation, like an FD or a fixed-rate deposit would not). At least
+// one selected holding must have real history, or there are no dates to
+// build a timeline from at all.
+function buildHistoricalDataset(selected, windowYears = 0) {
+  const n = selected.length;
+  const withHistory = selected.filter((p) => p.history);
+  if (withHistory.length === 0) {
+    return { error: "None of the selected holdings have historical data uploaded, so there is no real timeline to build." };
+  }
+  let common = withHistory[0].history.days;
+  for (let i = 1; i < withHistory.length; i++) common = intersectSorted(common, withHistory[i].history.days);
+  if (windowYears > 0 && common.length > 0) {
+    const cutoff = common[common.length - 1] - windowYears * 365.25;
+    const first = common.findIndex((d) => d >= cutoff);
+    common = common.slice(Math.max(0, first));
+  }
+  if (common.length < 40) {
+    return {
+      error: `Only ${common.length} dates are shared by the instruments with historical data (at least 40 are needed). Check that the files cover the same period.`,
+    };
+  }
+  const T = common.length - 1;
+  const spanYears = (common[common.length - 1] - common[0]) / 365.25;
+  const obsPerYear = T / spanYears;
+  const R = new Float64Array(T * n);
+  const fixedNames = [];
+  for (let i = 0; i < n; i++) {
+    const h = selected[i].history;
+    if (!h) {
+      // No history for this holding: a constant daily log return derived
+      // from its manual return field, repeated for every day -- zero
+      // variance, so it carries none of the simulated risk.
+      fixedNames.push(selected[i].name);
+      const fixedDaily = selected[i].return / obsPerYear;
+      for (let t = 0; t < T; t++) R[t * n + i] = fixedDaily;
+      continue;
+    }
+    let p = 0;
+    let prev = null;
+    for (let t = 0; t < common.length; t++) {
+      while (h.days[p] < common[t]) p += 1;
+      const price = h.prices[p];
+      if (prev !== null) R[(t - 1) * n + i] = Math.log(price / prev);
+      prev = price;
+    }
+  }
+  const cum = new Float64Array((T + 1) * n);
+  for (let t = 0; t < T; t++) for (let i = 0; i < n; i++) cum[(t + 1) * n + i] = cum[t * n + i] + R[t * n + i];
+  const dpm = Math.max(1, Math.round(obsPerYear / 12));
+  if (T < 2 * dpm) return { error: "Not enough shared history to build even a few months of returns." };
+  return {
+    n,
+    T,
+    R,
+    cum,
+    days: common,
+    dates: common.map(dayToIso),
+    spanYears,
+    obsPerYear,
+    dpm,
+    names: selected.map((p) => p.name),
+    fixedNames,
+  };
+}
+
+// Historical simulation: builds many possible futures by re-using real
+// history. Each simulated month is a real stretch of trading days (one
+// "month" of consecutive days) copied from the past for ALL instruments at
+// once, so their real co-movement is kept exactly. Stretches are drawn in
+// blocks of blockMonths consecutive months, which also keeps real volatility
+// clustering and momentum inside a block. Same output shape as the parametric
+// scenario engine: growth[path][month][instrument].
+function generateHistoricalScenarios(ds, { years, count, blockMonths }) {
+  const { n, T, dpm, cum } = ds;
+  const steps = Math.max(1, Math.round(years * 12));
+  const b = Math.max(1, Math.min(blockMonths, Math.floor(T / dpm)));
+  const maxStart = T - b * dpm;
+  const growth = new Float64Array(count * steps * n);
+  let idx = 0;
+  for (let sim = 0; sim < count; sim++) {
+    let start = 0;
+    for (let s = 0; s < steps; s++) {
+      if (s % b === 0) start = Math.floor(Math.random() * (maxStart + 1));
+      const from = start + (s % b) * dpm;
+      const to = from + dpm;
+      for (let i = 0; i < n; i++) growth[idx++] = Math.exp(cum[to * n + i] - cum[from * n + i]);
+    }
+  }
+  return { n, steps, count, growth };
+}
+
+// What a fixed allocation would actually have done over rows [from, to) of the
+// real history (rebalanced on the user's schedule, costs included).
+function backtestPortfolio(ds, weights, rebalanceInfo, amount, from = 0, to = ds.T) {
+  const { n, R } = ds;
+  const len = to - from;
+  const values = new Float64Array(len + 1);
+  const vals = new Float64Array(n);
+  for (let i = 0; i < n; i++) vals[i] = weights[i] * amount;
+  let total = amount;
+  values[0] = total;
+  const rebalanceEnabled = !!rebalanceInfo?.enabled;
+  const rowsPerRebalance = rebalanceEnabled
+    ? Math.max(1, Math.round(ds.obsPerYear / rebalanceInfo.rebalancesPerYear))
+    : 0;
+  const costFraction = rebalanceEnabled ? (rebalanceInfo.costPct || 0) / 100 : 0;
+  let peak = amount;
+  let maxDrawdown = 0;
+  const logs = new Float64Array(len);
+  let sum = 0;
+  for (let t = 0; t < len; t++) {
+    let newTotal = 0;
+    for (let i = 0; i < n; i++) {
+      vals[i] *= Math.exp(R[(from + t) * n + i]);
+      newTotal += vals[i];
+    }
+    if (rebalanceEnabled && (t + 1) % rowsPerRebalance === 0 && t + 1 !== len) {
+      newTotal *= 1 - costFraction;
+      for (let i = 0; i < n; i++) vals[i] = weights[i] * newTotal;
+    }
+    logs[t] = Math.log(newTotal / total);
+    sum += logs[t];
+    total = newTotal;
+    values[t + 1] = total;
+    if (total > peak) peak = total;
+    maxDrawdown = Math.min(maxDrawdown, total / peak - 1);
+  }
+  const mean = sum / len;
+  let ss = 0;
+  for (let t = 0; t < len; t++) ss += (logs[t] - mean) ** 2;
+  const years = Math.max(len / ds.obsPerYear, 1e-6);
+  const cagr = Math.pow(total / amount, 1 / years) - 1;
+  const vol = Math.sqrt(ss / Math.max(1, len - 1)) * Math.sqrt(ds.obsPerYear);
+  return { values, cagr, vol, maxDrawdown, ratio: vol > 0 ? cagr / vol : 0 };
+}
+
+// Fast version for the optimizer: only the final portfolio value per simulated
+// future (and, if asked, each future's worst peak-to-trough fall).
+function evaluateFinals(weights, scen, amount, rebalanceInfo, ddOut = null) {
+  const { n, steps, count, growth } = scen;
+  const rebalanceEnabled = !!rebalanceInfo?.enabled;
+  const interval = rebalanceEnabled ? Math.max(1, Math.round(12 / rebalanceInfo.rebalancesPerYear)) : 0;
+  const costFraction = rebalanceEnabled ? (rebalanceInfo.costPct || 0) / 100 : 0;
+  const finals = new Float64Array(count);
+  const vals = new Float64Array(n);
+  for (let sim = 0; sim < count; sim++) {
+    for (let i = 0; i < n; i++) vals[i] = weights[i] * amount;
+    let total = amount;
+    let peak = amount;
+    let maxDD = 0;
+    const base = sim * steps * n;
+    for (let s = 1; s <= steps; s++) {
+      total = 0;
+      const off = base + (s - 1) * n;
+      for (let i = 0; i < n; i++) {
+        vals[i] *= growth[off + i];
+        total += vals[i];
+      }
+      if (rebalanceEnabled && s % interval === 0 && s !== steps) {
+        total *= 1 - costFraction;
+        for (let i = 0; i < n; i++) vals[i] = weights[i] * total;
+      }
+      if (ddOut) {
+        if (total > peak) peak = total;
+        const d = total / peak - 1;
+        if (d < maxDD) maxDD = d;
+      }
+    }
+    finals[sim] = total;
+    if (ddOut) ddOut[sim] = maxDD;
+  }
+  return finals;
+}
+
+// Risk/return summary of an allocation from its simulated final values.
+// Return = annualised return of each simulated future; risk = how widely
+// those outcomes spread (volatility) or how deep the bad ones fall short of
+// the risk-free rate (downside). The ratios use the return ABOVE the
+// risk-free rate: without that, a near-riskless deposit would always "win"
+// simply because it has almost no volatility.
+function summarizeOutcomes(finals, amount, years, ddValues = null, riskFree = 0) {
+  const N = finals.length;
+  let sum = 0;
+  let sumSq = 0;
+  let downSq = 0;
+  let losses = 0;
+  for (let p = 0; p < N; p++) {
+    const r = Math.pow(Math.max(finals[p], 1e-9) / amount, 1 / years) - 1;
+    sum += r;
+    sumSq += r * r;
+    if (r < riskFree) downSq += (r - riskFree) ** 2;
+    if (finals[p] < amount) losses += 1;
+  }
+  const mean = sum / N;
+  const vol = Math.sqrt(Math.max(sumSq / N - mean * mean, 0));
+  const down = Math.sqrt(downSq / N);
+  return {
+    mean,
+    vol,
+    down,
+    probLoss: losses / N,
+    sharpe: vol > 1e-9 ? (mean - riskFree) / vol : 0,
+    sortino: (mean - riskFree) / Math.max(down, 1e-4),
+    medianDD: ddValues ? percentileOfSorted(ddValues.slice().sort(), 50) : null,
+  };
+}
+
+const OBJECTIVE_OPTIONS = [
+  { value: "sharpe", label: "Best extra return per risk (volatility)" },
+  { value: "sortino", label: "Best extra return per downside risk" },
+  { value: "losscap", label: "Highest return, limited chance of loss" },
+];
+
+// Results are noisy estimates, so the chance-of-loss limit gets a small safety
+// margin: candidates must beat it by this much during the search, and may miss
+// it by this much when the finalists are re-checked on fresh futures.
+const LOSS_CAP_MARGIN = 0.005;
+
+// Higher score = better. With a loss limit, anything above the limit is
+// heavily penalised.
+function objectiveScore(m, objective, lossLimit = 0.1) {
+  if (objective === "sortino") return m.sortino;
+  if (objective === "losscap") return m.probLoss <= lossLimit ? m.mean : -1 - (m.probLoss - lossLimit) * 100;
+  return m.sharpe;
+}
+
+function normalizeWeights(w) {
+  const total = w.reduce((a, b) => a + b, 0);
+  return total > 0 ? w.map((x) => x / total) : w.map(() => 1 / w.length);
+}
+
+// A random allocation. The power shapes it: low = spread out, high = a few
+// dominant holdings; sometimes some holdings are dropped altogether so
+// concentrated portfolios get explored too.
+function randomWeights(n) {
+  const power = [0.6, 1, 1, 2, 3][Math.floor(Math.random() * 5)];
+  let w = Array.from({ length: n }, () => Math.pow(-Math.log(Math.random() || 1e-12), power));
+  if (n > 2 && Math.random() < 0.25) {
+    const keep = Math.floor(Math.random() * n);
+    w = w.map((x, i) => (i === keep || Math.random() < 0.6 ? x : 0));
+  }
+  return normalizeWeights(w);
+}
+
+// A small random move away from an existing allocation: either jitter every
+// weight, or shift some weight from one holding to another.
+function perturbWeights(w, sigma) {
+  const n = w.length;
+  if (Math.random() < 0.5) {
+    return normalizeWeights(w.map((x) => Math.max(0, x + sigma * standardNormalRandom())));
+  }
+  const out = [...w];
+  const from = Math.floor(Math.random() * n);
+  let to = Math.floor(Math.random() * n);
+  if (to === from) to = (to + 1) % n;
+  const delta = Math.random() * Math.min(out[from], sigma * 3);
+  out[from] -= delta;
+  out[to] += delta;
+  return normalizeWeights(out);
+}
+
+// Time-boxed random search for the best allocation on the historical
+// simulation.
+//   * Phase 1 (first half of the time): try lots of random allocations.
+//   * Phase 2: keep making smaller and smaller random moves around the best
+//     ones found so far.
+// Every allocation is scored on the SAME simulated futures, so differences are
+// real differences and not luck of the draw. Because picking the best of
+// thousands of tries flatters the winner, the finalists are finally re-scored
+// on a fresh, independent set of futures and the winner is chosen there.
+function createHistoricalSearch({
+  dataset,
+  amount,
+  years,
+  blockMonths,
+  rebalanceInfo,
+  objective,
+  lossLimit = 0.1,
+  riskFree = 0.06,
+  startWeights,
+  paths = 1000,
+  validationPaths = 3000,
+}) {
+  const n = dataset.n;
+  const scen = generateHistoricalScenarios(dataset, { years, count: paths, blockMonths });
+  const CLOUD_MAX = 1500;
+  const cloud = [];
+  let cloudSeen = 0;
+  let tested = 0;
+  let best = null;
+  const elites = [];
+
+  const evalOn = (sc, w, withDD = false) => {
+    const dd = withDD ? new Float64Array(sc.count) : null;
+    return summarizeOutcomes(evaluateFinals(w, sc, amount, rebalanceInfo, dd), amount, years, dd, riskFree);
+  };
+  const searchLimit = lossLimit - LOSS_CAP_MARGIN;
+
+  function consider(w) {
+    const m = evalOn(scen, w);
+    const cand = { w, m, score: objectiveScore(m, objective, searchLimit) };
+    tested += 1;
+    const point = { x: m.vol * 100, y: m.mean * 100 };
+    cloudSeen += 1;
+    if (cloud.length < CLOUD_MAX) cloud.push(point);
+    else {
+      const j = Math.floor(Math.random() * cloudSeen);
+      if (j < CLOUD_MAX) cloud[j] = point;
+    }
+    if (!best || cand.score > best.score) best = cand;
+    // Keep the best few DISTINCT allocations (near-duplicates replace each
+    // other), so the finalists cover different regions, not one clone.
+    const near = elites.findIndex((e) => e.w.reduce((d, x, i) => d + Math.abs(x - w[i]), 0) < 0.03);
+    if (near >= 0) {
+      if (cand.score > elites[near].score) elites[near] = cand;
+    } else elites.push(cand);
+    elites.sort((x, y) => y.score - x.score);
+    if (elites.length > 8) elites.length = 8;
+    return cand;
+  }
+
+  // Seeds: your current allocation, equal weights, and each holding alone.
+  const baselineW = normalizeWeights(startWeights);
+  const baselineInSample = consider(baselineW);
+  consider(Array(n).fill(1 / n));
+  for (let i = 0; i < n; i++) consider(Array.from({ length: n }, (_, j) => (i === j ? 1 : 0)));
+
+  function step(deadline, progress) {
+    while (Date.now() < deadline) {
+      if (progress < 0.5) {
+        if (Math.random() < 0.15 && best) consider(perturbWeights(best.w, 0.1));
+        else consider(randomWeights(n));
+      } else {
+        const t = Math.min(1, (progress - 0.5) / 0.5);
+        const sigma = 0.12 * (1 - t) + 0.004 * t;
+        if (Math.random() < 0.1) consider(randomWeights(n));
+        else {
+          const parent = elites[Math.floor(Math.pow(Math.random(), 2) * elites.length)];
+          consider(perturbWeights(parent.w, sigma));
+        }
+      }
+    }
+  }
+
+  function getProgress() {
+    const stride = Math.max(1, Math.ceil(cloud.length / 400));
+    const sample = [];
+    for (let i = 0; i < cloud.length; i += stride) sample.push(cloud[i]);
+    return {
+      tested,
+      best: best ? { w: best.w, m: best.m, point: { x: best.m.vol * 100, y: best.m.mean * 100 } } : null,
+      cloud: sample,
+    };
+  }
+
+  function finish() {
+    const fresh = generateHistoricalScenarios(dataset, { years, count: validationPaths, blockMonths });
+    const measured = [baselineW, ...elites.map((e) => e.w)].map((w) => ({ w, m: evalOn(fresh, w, true) }));
+    const finalists = measured.map((f) => ({ ...f, score: objectiveScore(f.m, objective, lossLimit + LOSS_CAP_MARGIN) }));
+    const baseline = finalists[0];
+    let top = baseline;
+    for (const f of finalists) if (f.score > top.score + 1e-9) top = f;
+    // A "better" allocation must be better by a meaningful margin, otherwise
+    // the difference is just noise and the current allocation is kept.
+    const minGain = objective === "losscap" ? (baseline.m.probLoss <= lossLimit + LOSS_CAP_MARGIN ? 0.002 : 0) : 0.03;
+    const winner = top.score > baseline.score + minGain ? top : baseline;
+    const equalW = Array(n).fill(1 / n);
+    const winnerInSample = evalOn(scen, winner.w);
+    return {
+      winner,
+      baseline,
+      equal: { w: equalW, m: evalOn(fresh, equalW, true) },
+      improved: winner !== baseline,
+      tested,
+      cloud,
+      searchBest: { x: winnerInSample.vol * 100, y: winnerInSample.mean * 100 },
+      searchBaseline: { x: baselineInSample.m.vol * 100, y: baselineInSample.m.mean * 100 },
+      paths,
+      validationPaths,
+    };
+  }
+
+  return { step, getProgress, finish };
+}
+
+// Back-test of the recommended, current and equal-weight allocations (and each
+// instrument on its own) on the real history, plus the same numbers for the
+// first and second half of the history as a consistency check.
+function buildHistoricalAnalysis(ds, selected, finalW, currentW, rebalanceInfo, amount, riskFree = 0) {
+  const n = ds.n;
+  const single = (i) => Array.from({ length: n }, (_, j) => (j === i ? 1 : 0));
+  const noRebalance = { enabled: false };
+  const portfolios = [
+    { key: "final", label: "Recommended allocation", w: finalW, reb: rebalanceInfo },
+    { key: "current", label: "Current allocation", w: currentW, reb: rebalanceInfo },
+    { key: "equal", label: "Equal weight", w: Array(n).fill(1 / n), reb: rebalanceInfo },
+    ...selected.map((p, i) => ({ key: `asset${i}`, label: p.name, w: single(i), reb: noRebalance })),
+  ];
+  // Return per risk uses the return above the risk-free rate.
+  const withRatio = (bt) => ({ ...bt, ratio: bt.vol > 0 ? (bt.cagr - riskFree) / bt.vol : 0 });
+  // Drop the (large) day-by-day values array once cagr/vol/drawdown/ratio are
+  // read off it -- the half-period checks below only need the summary numbers.
+  const summaryOnly = (bt) => {
+    const { values, ...rest } = withRatio(bt);
+    return rest;
+  };
+  const full = portfolios.map((pf) => ({ ...pf, bt: withRatio(backtestPortfolio(ds, pf.w, pf.reb, amount)) }));
+  const mid = Math.floor(ds.T / 2);
+  const halves = portfolios.slice(0, 3).map((pf) => ({
+    key: pf.key,
+    label: pf.label,
+    first: summaryOnly(backtestPortfolio(ds, pf.w, pf.reb, amount, 0, mid)),
+    second: summaryOnly(backtestPortfolio(ds, pf.w, pf.reb, amount, mid, ds.T)),
+  }));
+  const stride = Math.max(1, Math.ceil(ds.T / 240));
+  const chart = [];
+  for (let t = 0; t <= ds.T; t += stride) {
+    const row = { date: ds.dates[t] };
+    full.forEach((f) => {
+      if (f.key === "final" || f.key === "current" || f.key.startsWith("asset")) row[f.key] = f.bt.values[t];
+    });
+    chart.push(row);
+  }
+  if ((ds.T % stride) !== 0) {
+    const row = { date: ds.dates[ds.T] };
+    full.forEach((f) => {
+      if (f.key === "final" || f.key === "current" || f.key.startsWith("asset")) row[f.key] = f.bt.values[ds.T];
+    });
+    chart.push(row);
+  }
+  return {
+    rows: full.map((f) => ({ key: f.key, label: f.label, cagr: f.bt.cagr, vol: f.bt.vol, maxDrawdown: f.bt.maxDrawdown, ratio: f.bt.ratio })),
+    halves,
+    chart,
+    midDate: ds.dates[mid],
+  };
+}
+
 // --- ANIMATION HELPERS --------------------------------------------------
 function useCountUp(target, duration = 900) {
   const [value, setValue] = useState(0);
@@ -1075,8 +1949,12 @@ export default function PortfolioAllocationApp() {
   const [products, setProducts] = useState([]);
   const [form, setForm] = useState({
     name: "",
+    mode: "manual",
     returnPct: "",
     stdPct: "",
+    csvText: "",
+    fileName: "",
+    keepHistory: false,
   });
 
   const [selectedIds, setSelectedIds] = useState([]);
@@ -1093,16 +1971,24 @@ export default function PortfolioAllocationApp() {
   const [editingId, setEditingId] = useState(null);
 
   function resetForm() {
-    setForm({ name: "", returnPct: "", stdPct: "" });
+    setForm({ name: "", mode: "manual", returnPct: "", stdPct: "", csvText: "", fileName: "", keepHistory: false });
     setEditingId(null);
   }
 
   function startEditProduct(product) {
-    setForm({
-      name: product.name,
-      returnPct: String(Number((product.return * 100).toFixed(4))),
-      stdPct: String(Number((product.std * 100).toFixed(4))),
-    });
+    if (product.history) {
+      setForm({ name: product.name, mode: "data", returnPct: "", stdPct: "", csvText: "", fileName: "", keepHistory: true });
+    } else {
+      setForm({
+        name: product.name,
+        mode: "manual",
+        returnPct: String(Number((product.return * 100).toFixed(4))),
+        stdPct: String(Number((product.std * 100).toFixed(4))),
+        csvText: "",
+        fileName: "",
+        keepHistory: false,
+      });
+    }
     setEditingId(product.id);
     setError("");
   }
@@ -1112,26 +1998,64 @@ export default function PortfolioAllocationApp() {
       setError("Product name is required.");
       return;
     }
-    if (form.returnPct === "" || form.stdPct === "") {
-      setError("Enter both return (%) and std (%).");
-      return;
-    }
-    const returnVal = Number(form.returnPct) / 100;
-    const stdVal = Number(form.stdPct) / 100;
-    if (Number.isNaN(returnVal) || Number.isNaN(stdVal)) {
-      setError("Return and std must be valid numbers.");
-      return;
-    }
-    if (stdVal <= 0) {
-      setError("Std must be greater than 0.");
-      return;
+
+    let returnVal;
+    let stdVal;
+    let history; // undefined = manual product
+
+    if (form.mode === "data") {
+      if (form.csvText.trim()) {
+        const parsed = parseHistoricalCsv(form.csvText);
+        if (!parsed.ok) {
+          setError(parsed.error);
+          return;
+        }
+        history = {
+          days: parsed.days,
+          dates: parsed.dates,
+          prices: parsed.prices,
+          stats: parsed.stats,
+          warnings: parsed.warnings,
+          fileName: form.fileName || "pasted data",
+        };
+      } else if (editingId !== null) {
+        const existing = products.find((p) => p.id === editingId);
+        if (existing && existing.history) history = existing.history;
+      }
+      if (!history) {
+        setError("Add the historical data: upload a CSV file or paste its contents.");
+        return;
+      }
+      returnVal = history.stats.mu;
+      stdVal = history.stats.sigma;
+      if (!Number.isFinite(returnVal) || !(stdVal > 0)) {
+        setError("The data has no usable price variation (std is 0). Check the Price column.");
+        return;
+      }
+    } else {
+      if (form.returnPct === "" || form.stdPct === "") {
+        setError("Enter both return (%) and std (%).");
+        return;
+      }
+      returnVal = Number(form.returnPct) / 100;
+      stdVal = Number(form.stdPct) / 100;
+      if (Number.isNaN(returnVal) || Number.isNaN(stdVal)) {
+        setError("Return and std must be valid numbers.");
+        return;
+      }
+      if (stdVal <= 0) {
+        setError("Std must be greater than 0.");
+        return;
+      }
     }
 
     if (editingId !== null) {
       setProducts((prev) =>
-        prev.map((p) =>
-          p.id === editingId ? { ...p, name: form.name.trim(), return: returnVal, std: stdVal } : p
-        )
+        prev.map((p) => {
+          if (p.id !== editingId) return p;
+          const { history: _oldHistory, ...rest } = p;
+          return { ...rest, name: form.name.trim(), return: returnVal, std: stdVal, ...(history ? { history } : {}) };
+        })
       );
     } else {
       const newProduct = {
@@ -1139,6 +2063,7 @@ export default function PortfolioAllocationApp() {
         name: form.name.trim(),
         return: returnVal,
         std: stdVal,
+        ...(history ? { history } : {}),
       };
       setProducts((prev) => [...prev, newProduct]);
     }
@@ -1231,6 +2156,32 @@ export default function PortfolioAllocationApp() {
         : { enabled: false },
     });
     setScreen("result");
+  }
+
+  // Re-derives the headline metrics for a different set of weights (used when
+  // the historical simulation's allocation is applied or undone).
+  function resultWithWeights(prev, newWeights, customized) {
+    const r = prev.selected.map((p) => p.return);
+    const metrics = portfolioMetrics(newWeights, r, prev.Sigma);
+    const drag = prev.rebalance && prev.rebalance.enabled ? prev.rebalance.drag : 0;
+    const netReturn = metrics.portReturn - drag;
+    return {
+      ...prev,
+      weights: newWeights,
+      ...metrics,
+      netReturn,
+      expectedValue: amount * (1 + netReturn),
+      optimizerWeights: prev.optimizerWeights || prev.weights,
+      customized,
+    };
+  }
+
+  function applyWeights(newWeights) {
+    setResult((prev) => (prev ? resultWithWeights(prev, newWeights, true) : prev));
+  }
+
+  function restoreOptimizerWeights() {
+    setResult((prev) => (prev && prev.optimizerWeights ? resultWithWeights(prev, prev.optimizerWeights, false) : prev));
   }
 
   const chartData = useMemo(() => {
@@ -1346,7 +2297,14 @@ export default function PortfolioAllocationApp() {
         )}
 
         {screen === "result" && result && (
-          <ResultScreen result={result} amount={amount} chartData={chartData} onBack={() => setScreen("run")} />
+          <ResultScreen
+            result={result}
+            amount={amount}
+            chartData={chartData}
+            onBack={() => setScreen("run")}
+            onApplyWeights={applyWeights}
+            onRestoreWeights={restoreOptimizerWeights}
+          />
         )}
       </div>
     </div>
@@ -1395,28 +2353,54 @@ function ConfigScreen({
           />
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs text-neutral-500 mb-1">Return (%)</label>
-            <input
-              type="number"
-              value={form.returnPct}
-              onChange={(e) => setForm((f) => ({ ...f, returnPct: e.target.value }))}
-              placeholder="e.g. 13"
-              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 placeholder-neutral-600 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
-            />
-          </div>
-          <div>
-            <label className="block text-xs text-neutral-500 mb-1">Std (%)</label>
-            <input
-              type="number"
-              value={form.stdPct}
-              onChange={(e) => setForm((f) => ({ ...f, stdPct: e.target.value }))}
-              placeholder="e.g. 18"
-              className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 placeholder-neutral-600 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
-            />
+        <div>
+          <label className="block text-xs text-neutral-500 mb-1.5">Return &amp; std source</label>
+          <div className="flex gap-2">
+            {[
+              ["manual", "Manual"],
+              ["data", "Historical data"],
+            ].map(([m, label]) => (
+              <button
+                key={m}
+                onClick={() => setForm((f) => ({ ...f, mode: m }))}
+                className={`px-3 py-1.5 text-sm rounded-md border transition-colors ${
+                  form.mode === m
+                    ? "bg-neutral-100 text-black border-neutral-100 font-medium"
+                    : "bg-black text-neutral-400 border-neutral-700 hover:border-neutral-600"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
         </div>
+
+        {form.mode === "manual" ? (
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs text-neutral-500 mb-1">Return (%)</label>
+              <input
+                type="number"
+                value={form.returnPct}
+                onChange={(e) => setForm((f) => ({ ...f, returnPct: e.target.value }))}
+                placeholder="e.g. 13"
+                className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 placeholder-neutral-600 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-neutral-500 mb-1">Std (%)</label>
+              <input
+                type="number"
+                value={form.stdPct}
+                onChange={(e) => setForm((f) => ({ ...f, stdPct: e.target.value }))}
+                placeholder="e.g. 18"
+                className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 placeholder-neutral-600 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
+              />
+            </div>
+          </div>
+        ) : (
+          <HistoricalDataInput form={form} setForm={setForm} editingId={editingId} products={products} />
+        )}
 
         <div className="flex items-center gap-2">
           <button
@@ -1463,7 +2447,22 @@ function ConfigScreen({
                       p.id === editingId ? "bg-white/5" : ""
                     }`}
                   >
-                    <td className="px-4 py-2.5 text-neutral-200">{p.name}</td>
+                    <td className="px-4 py-2.5 text-neutral-200">
+                      <div className="flex items-center gap-1.5">
+                        <span className="truncate">{p.name}</span>
+                        {p.history && (
+                          <Database
+                            className="w-3.5 h-3.5 text-neutral-500 shrink-0"
+                            title={`From historical data: ${isoToLabel(p.history.dates[0])} – ${isoToLabel(p.history.dates[p.history.dates.length - 1])}`}
+                          />
+                        )}
+                      </div>
+                      {p.history && (
+                        <div className="text-[13px] text-neutral-600 whitespace-nowrap">
+                          {isoToLabel(p.history.dates[0])} – {isoToLabel(p.history.dates[p.history.dates.length - 1])}
+                        </div>
+                      )}
+                    </td>
                     <td className="px-4 py-2.5 font-mono text-white">{(p.return * 100).toFixed(2)}%</td>
                     <td className="px-4 py-2.5 font-mono text-neutral-300">{(p.std * 100).toFixed(2)}%</td>
                     <td className="px-4 py-2.5 text-right">
@@ -1497,7 +2496,7 @@ function ConfigScreen({
           <div className="px-4 py-3 bg-neutral-900 border-b border-neutral-800">
             <h2 className="text-sm font-semibold text-neutral-200">Correlation matrix</h2>
             <p className="text-xs text-neutral-500 mt-0.5">
-              Set the correlation for each pair (between -1 and 1). Pairs you have not set default to 0 (uncorrelated).
+              Set the correlation for each pair (between -1 and 1). A small database icon means it was measured from historical data; pairs with neither an override nor shared data default to 0 (uncorrelated).
             </p>
           </div>
           <div className="overflow-x-auto">
@@ -1528,9 +2527,15 @@ function ConfigScreen({
                       }
                       const key = pairKeyById(rowP.id, colP.id);
                       const isOverridden = corrOverrides[key] !== undefined;
+                      const source = correlationSource(rowP, colP, corrOverrides);
                       const value = getCorrelation(rowP, colP, corrOverrides);
                       return (
-                        <td key={colP.id} className={`px-2 py-1.5 text-center ${isOverridden ? "bg-white/10" : ""}`}>
+                        <td
+                          key={colP.id}
+                          className={`px-2 py-1.5 text-center ${
+                            source === "manual" ? "bg-white/10" : source === "data" ? "bg-white/5" : ""
+                          }`}
+                        >
                           <div className="flex items-center justify-center gap-1">
                             <input
                               type="number"
@@ -1545,7 +2550,7 @@ function ConfigScreen({
                               }}
                               className="w-16 text-sm text-center font-mono bg-black border border-neutral-700 rounded px-1 py-0.5 text-neutral-100 focus:outline-none focus:border-neutral-300"
                             />
-                            {isOverridden && (
+                            {isOverridden ? (
                               <button
                                 onClick={() => onCorrReset(rowP.id, colP.id)}
                                 className="text-neutral-600 hover:text-neutral-300"
@@ -1553,7 +2558,9 @@ function ConfigScreen({
                               >
                                 <RotateCcw className="w-3 h-3" />
                               </button>
-                            )}
+                            ) : source === "data" ? (
+                              <Database className="w-3 h-3 text-neutral-500" title="Measured from historical data" />
+                            ) : null}
                           </div>
                         </td>
                       );
@@ -1564,6 +2571,124 @@ function ConfigScreen({
             </table>
           </div>
         </Card>
+      )}
+    </div>
+  );
+}
+
+// The "Historical data" mode of the Add Product form: upload or paste a
+// price-history CSV (Date + Price/Close, comma/semicolon/tab, quoted or not
+// -- the same shape exchanges like investing.com, Yahoo Finance, or an AMFI
+// NAV export use) and preview what the simulator will actually use from it.
+function HistoricalDataInput({ form, setForm, editingId, products }) {
+  const fileInputRef = useRef(null);
+  const existing = editingId !== null ? products.find((p) => p.id === editingId) : null;
+  const usingExisting = form.keepHistory && !form.csvText.trim() && existing && existing.history;
+
+  const preview = useMemo(() => {
+    if (!form.csvText.trim()) return null;
+    return parseHistoricalCsv(form.csvText);
+  }, [form.csvText]);
+
+  function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setForm((f) => ({
+        ...f,
+        csvText: String(reader.result || ""),
+        fileName: file.name,
+        keepHistory: false,
+        name: f.name.trim() ? f.name : guessNameFromFile(file.name),
+      }));
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }
+
+  if (usingExisting) {
+    const h = existing.history;
+    return (
+      <div className="space-y-2">
+        <div className="rounded-lg border border-neutral-700 px-3 py-2.5 flex items-start gap-2.5">
+          <Database className="w-4 h-4 text-neutral-300 shrink-0 mt-0.5" />
+          <div className="min-w-0">
+            <p className="text-sm text-neutral-200">Using the data already uploaded for this product.</p>
+            <p className="text-xs text-neutral-500 mt-0.5">
+              {h.prices.length.toLocaleString("en-IN")} prices · {isoToLabel(h.dates[0])} to{" "}
+              {isoToLabel(h.dates[h.dates.length - 1])} · CAGR {fmtPct(h.stats.cagr)} · std {fmtPct(h.stats.sigma)}
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={() => setForm((f) => ({ ...f, keepHistory: false }))}
+          className="text-xs text-neutral-400 hover:text-neutral-200 underline"
+        >
+          Replace with new data
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2.5">
+      <div className="flex items-center gap-2">
+        <input ref={fileInputRef} type="file" accept=".csv,.txt" onChange={handleFile} className="hidden" />
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="flex items-center gap-1.5 text-sm text-neutral-200 border border-neutral-700 hover:border-neutral-500 px-3 py-2 rounded-md transition-colors"
+        >
+          <Upload className="w-4 h-4" />
+          Upload CSV file
+        </button>
+        {form.fileName && <span className="text-xs text-neutral-500 truncate">{form.fileName}</span>}
+      </div>
+
+      <div>
+        <label className="flex items-center gap-1.5 text-xs text-neutral-500 mb-1">
+          <FileText className="w-3.5 h-3.5" />
+          Or paste the CSV contents
+        </label>
+        <textarea
+          value={form.csvText}
+          onChange={(e) => setForm((f) => ({ ...f, csvText: e.target.value, fileName: f.fileName && e.target.value ? f.fileName : "" }))}
+          rows={5}
+          placeholder={'"Date","Price"\n"09/18/2026","22,901.85"\n"09/17/2026","22,568.85"\n...'}
+          className="w-full text-xs bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 placeholder-neutral-600 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300"
+        />
+        <p className="text-[13px] text-neutral-600 mt-1">
+          Needs a Date column and a Price (or Close/NAV) column, at least {MIN_HISTORY_POINTS} rows. Comma, semicolon
+          or tab separated; quoted or not; DD/MM/YYYY, MM/DD/YYYY or YYYY-MM-DD dates.
+        </p>
+      </div>
+
+      {preview && !preview.ok && (
+        <div className="text-sm text-neutral-100 bg-neutral-900 border border-neutral-500 rounded-lg px-3 py-2">
+          {preview.error}
+        </div>
+      )}
+
+      {preview && preview.ok && (
+        <div className="rounded-lg border border-neutral-700 px-3 py-2.5 space-y-2 anim-in">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            <StatBox label="Prices" value={preview.prices.length.toLocaleString("en-IN")} />
+            <StatBox label="Date range" value={`${preview.stats.spanYears.toFixed(1)}y`} hint={`${isoToLabel(preview.dates[0])} – ${isoToLabel(preview.dates[preview.dates.length - 1])}`} />
+            <StatBox label="CAGR" value={fmtPct(preview.stats.cagr)} tone="text-white" />
+            <StatBox label="Std (annualized)" value={fmtPct(preview.stats.sigma)} />
+          </div>
+          <p className="text-[13px] text-neutral-600">
+            The simulator will use return {fmtPct(preview.stats.mu)} (continuous) and std {fmtPct(preview.stats.sigma)}, measured
+            directly from these prices.
+          </p>
+          {preview.warnings.length > 0 && (
+            <ul className="text-[13px] text-neutral-500 space-y-0.5 list-disc pl-4">
+              {preview.warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
     </div>
   );
@@ -1629,6 +2754,11 @@ function RunScreen({
                       className="accent-white"
                     />
                     <span className="flex-1 text-neutral-200 min-w-0 truncate">{p.name}</span>
+                    {p.history && (
+                      <span className="text-[13px] text-neutral-400 border border-neutral-700 rounded px-1.5 leading-tight">
+                        data
+                      </span>
+                    )}
                     <span className="text-neutral-400 text-xs font-mono whitespace-nowrap">
                       {(p.return * 100).toFixed(1)}% / {(p.std * 100).toFixed(1)}%
                     </span>
@@ -1751,7 +2881,7 @@ function StatBox({ label, value, tone = "text-neutral-100", hint }) {
   );
 }
 
-function ResultScreen({ result, amount, chartData, onBack }) {
+function ResultScreen({ result, amount, chartData, onBack, onApplyWeights, onRestoreWeights }) {
   const { portReturn, netReturn, portVol, sharpeLike, riskLevel, expectedValue, selected, weights, rebalance, Sigma } =
     result;
 
@@ -1786,6 +2916,17 @@ function ResultScreen({ result, amount, chartData, onBack }) {
       if (mcTimerRef.current) clearTimeout(mcTimerRef.current);
     };
   }, []);
+
+  // A new allocation makes any earlier Monte Carlo output stale, so clear it.
+  function handleApplyWeights(newWeights) {
+    onApplyWeights(newWeights);
+    setMcOutput(null);
+  }
+
+  function handleRestoreWeights() {
+    onRestoreWeights();
+    setMcOutput(null);
+  }
 
   function handlePresetChange(value) {
     setMcPreset(value);
@@ -2010,7 +3151,14 @@ function ResultScreen({ result, amount, chartData, onBack }) {
 
       {/* Holdings breakdown */}
       <Card className="p-4 sm:p-5 anim-in" style={{ animationDelay: "220ms" }}>
-        <h2 className="text-sm font-semibold text-neutral-200 mb-3">Holdings</h2>
+        <div className="flex items-center justify-between gap-2 mb-3">
+          <h2 className="text-sm font-semibold text-neutral-200">Holdings</h2>
+          {result.customized && (
+            <span className="text-xs text-neutral-200 bg-white/5 border border-neutral-600 rounded-full px-2 py-0.5">
+              Set by historical simulation
+            </span>
+          )}
+        </div>
         <div className="space-y-3">
           {selected.map((p, i) => {
             const pct = weights[i] * 100;
@@ -2582,6 +3730,13 @@ function ResultScreen({ result, amount, chartData, onBack }) {
         )}
       </Card>
 
+      <HistoricalSearchCard
+        result={result}
+        amount={amount}
+        onApply={handleApplyWeights}
+        onRestore={handleRestoreWeights}
+      />
+
       <button
         onClick={onBack}
         className="flex items-center gap-1.5 text-sm text-neutral-300 border border-neutral-700 hover:bg-neutral-900 px-3.5 py-2 rounded-md transition-colors"
@@ -2592,6 +3747,613 @@ function ResultScreen({ result, amount, chartData, onBack }) {
     </div>
   );
 }
+
+function HistoricalSearchCard({ result, amount, onApply, onRestore }) {
+  const { selected, weights, rebalance } = result;
+  const hasAnyHistory = selected.some((p) => p.history);
+  const fixedProductNames = selected.filter((p) => !p.history).map((p) => p.name);
+
+  const [seconds, setSeconds] = useState("10");
+  const [horizon, setHorizon] = useState("1");
+  const [objective, setObjective] = useState("sharpe");
+  const [lossLimitPct, setLossLimitPct] = useState("10");
+  const [riskFreePct, setRiskFreePct] = useState("6");
+  const [blockMonths, setBlockMonths] = useState(3);
+  const [histWindow, setHistWindow] = useState("0");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [status, setStatus] = useState("idle"); // idle | running | finishing | done
+  const [live, setLive] = useState(null);
+  const [outcome, setOutcome] = useState(null);
+  const [applied, setApplied] = useState(false);
+  const cancelRef = useRef(false); // "Stop and use best so far" was pressed
+  const unmountedRef = useRef(false);
+  const timerRef = useRef(null);
+
+  // React StrictMode (the default in Vite/CRA dev builds) mounts, unmounts and
+  // re-mounts every component once, so the flag must be reset on every mount.
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  const windowYears = Number(histWindow) || 0;
+  const dataset = useMemo(
+    () => (hasAnyHistory ? buildHistoricalDataset(selected, windowYears) : null),
+    [selected, hasAnyHistory, windowYears]
+  );
+
+  if (!hasAnyHistory) {
+    return (
+      <Card className="p-4 sm:p-5 anim-in">
+        <div className="flex items-center gap-2 mb-1">
+          <Database className="w-4 h-4 text-neutral-300" />
+          <h2 className="text-sm font-semibold text-neutral-200">Historical analysis: best allocation</h2>
+        </div>
+        <p className="text-xs text-neutral-500">
+          Analyzes real historical prices and searches for the allocation with the best simulated return for its
+          risk. It needs historical data for at least one selected holding to have a real timeline to build on — add
+          it in the Configure step (mode: &quot;Historical data&quot;) for{" "}
+          <span className="text-neutral-300">{selected.map((p) => p.name).join(", ")}</span> to use this.
+        </p>
+      </Card>
+    );
+  }
+
+  if (dataset.error) {
+    return (
+      <Card className="p-4 sm:p-5 anim-in">
+        <div className="flex items-center gap-2 mb-1">
+          <Database className="w-4 h-4 text-neutral-300" />
+          <h2 className="text-sm font-semibold text-neutral-200">Historical analysis: best allocation</h2>
+        </div>
+        <p className="text-xs text-neutral-500">{dataset.error}</p>
+      </Card>
+    );
+  }
+
+  function finishSearch(search, usedObjective, secs, lossLimit, riskFree, blocks, years) {
+    setStatus("finishing");
+    timerRef.current = setTimeout(() => {
+      if (unmountedRef.current) return;
+      const res = search.finish();
+      const analysis = buildHistoricalAnalysis(dataset, selected, res.winner.w, res.baseline.w, rebalance, amount, riskFree);
+      setOutcome({ ...res, analysis, objective: usedObjective, seconds: secs, lossLimit, riskFree, blockMonths: blocks, years });
+      setStatus("done");
+    }, 30);
+  }
+
+  function handleStart() {
+    const secs = Math.min(300, Math.max(2, Number(seconds) || 10));
+    const usedObjective = objective;
+    const riskFree = Math.max(0, Number(riskFreePct) || 0) / 100;
+    const lossLimit = Math.min(0.9, Math.max(0.01, Number(lossLimitPct) || 10) / 100);
+    const blocks = Math.max(1, Math.min(24, Number(blockMonths) || 3));
+    const years = (MC_HORIZON_OPTIONS.find((h) => h.value === horizon) || MC_HORIZON_OPTIONS[1]).years;
+    cancelRef.current = false;
+    setStatus("running");
+    setOutcome(null);
+    setApplied(false);
+    setLive({ tested: 0, best: null, elapsed: 0, total: secs });
+    // Let the "running" state paint before the (brief) set-up work.
+    timerRef.current = setTimeout(() => {
+      if (unmountedRef.current) return;
+      const search = createHistoricalSearch({
+        dataset,
+        amount,
+        years,
+        blockMonths: blocks,
+        rebalanceInfo: rebalance,
+        objective: usedObjective,
+        lossLimit,
+        riskFree,
+        startWeights: weights,
+      });
+      const startedAt = Date.now();
+      let lastUi = 0;
+      const tick = () => {
+        if (unmountedRef.current) return;
+        const elapsed = (Date.now() - startedAt) / 1000;
+        if (cancelRef.current || elapsed >= secs) {
+          finishSearch(search, usedObjective, secs, lossLimit, riskFree, blocks, years);
+          return;
+        }
+        search.step(Date.now() + 40, elapsed / secs);
+        if (Date.now() - lastUi > 150) {
+          lastUi = Date.now();
+          setLive(search.getProgress());
+          setLive((prevLive) => ({ ...prevLive, elapsed, total: secs }));
+        }
+        timerRef.current = setTimeout(tick, 0);
+      };
+      tick();
+    }, 40);
+  }
+
+  function handleStop() {
+    cancelRef.current = true;
+  }
+
+  const running = status === "running" || status === "finishing";
+  const objectiveLabel = (OBJECTIVE_OPTIONS.find((o) => o.value === (outcome ? outcome.objective : objective)) || {}).label;
+
+  const metricRows = outcome
+    ? [
+        { label: "Simulated annual return", cur: fmtPct(outcome.baseline.m.mean, 2), best: fmtPct(outcome.winner.m.mean, 2) },
+        { label: "Risk (spread of outcomes)", cur: fmtPct(outcome.baseline.m.vol, 2), best: fmtPct(outcome.winner.m.vol, 2) },
+        { label: "Return per risk", cur: outcome.baseline.m.sharpe.toFixed(2), best: outcome.winner.m.sharpe.toFixed(2) },
+        {
+          label: "Return per downside risk",
+          cur: outcome.baseline.m.sortino.toFixed(2),
+          best: outcome.winner.m.sortino.toFixed(2),
+        },
+        { label: "Chance of loss", cur: fmtPct(outcome.baseline.m.probLoss, 1), best: fmtPct(outcome.winner.m.probLoss, 1) },
+      ]
+    : [];
+
+  return (
+    <Card className="p-4 sm:p-5 anim-in">
+      <div className="flex items-center gap-2 mb-1">
+        <Database className="w-4 h-4 text-neutral-300" />
+        <h2 className="text-sm font-semibold text-neutral-200">Historical analysis: best allocation</h2>
+      </div>
+      <p className="text-xs text-neutral-500 mb-4">
+        Uses the real prices you added — the timeline spans{" "}
+        <span className="text-neutral-300">{dataset.T.toLocaleString("en-IN")} trading days</span> from{" "}
+        <span className="text-neutral-300">
+          {isoToLabel(dataset.dates[0])} to {isoToLabel(dataset.dates[dataset.dates.length - 1])}
+        </span>{" "}
+        ({dataset.spanYears.toFixed(1)} years). It resamples real historical stretches (not a statistical assumption)
+        to build thousands of possible futures — keeping the real co-movement, volatility clustering and fat tails
+        between holdings exactly as they happened — searches those for the best risk-versus-return allocation, then
+        checks the winner against the actual historical timeline below.
+      </p>
+      {dataset.fixedNames.length > 0 && (
+        <p className="text-xs text-neutral-500 mb-4 rounded-lg border border-neutral-800 px-3 py-2.5">
+          <span className="text-neutral-300">{dataset.fixedNames.join(", ")}</span> — no historical data was added,
+          so {dataset.fixedNames.length === 1 ? "it is" : "they are"} treated as a fixed return (its entered return
+          held constant every day, no ups or downs) rather than a real price series. It contributes no risk and no
+          correlation with the others, the way a fixed deposit would not.
+        </p>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
+        <div>
+          <label className="block text-xs text-neutral-500 mb-1">Simulated horizon</label>
+          <select
+            value={horizon}
+            disabled={running}
+            onChange={(e) => setHorizon(e.target.value)}
+            className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300 disabled:opacity-60"
+          >
+            {MC_HORIZON_OPTIONS.map((h) => (
+              <option key={h.value} value={h.value}>
+                {h.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs text-neutral-500 mb-1">Run time (seconds)</label>
+          <input
+            type="number"
+            min="2"
+            max="300"
+            step="1"
+            value={seconds}
+            disabled={running}
+            onChange={(e) => setSeconds(e.target.value)}
+            className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300 disabled:opacity-60"
+          />
+        </div>
+        <div>
+          <label className="block text-xs text-neutral-500 mb-1">Goal</label>
+          <select
+            value={objective}
+            disabled={running}
+            onChange={(e) => setObjective(e.target.value)}
+            className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300 disabled:opacity-60"
+          >
+            {OBJECTIVE_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {objective === "losscap" && (
+        <div className="mb-4 max-w-xs">
+          <label className="block text-xs text-neutral-500 mb-1">Max acceptable chance of loss (%)</label>
+          <input
+            type="number"
+            min="1"
+            max="90"
+            step="1"
+            value={lossLimitPct}
+            disabled={running}
+            onChange={(e) => setLossLimitPct(e.target.value)}
+            className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300 disabled:opacity-60"
+          />
+          <p className="text-[13px] text-neutral-600 mt-0.5">
+            Among allocations at or below this chance of loss, picks the one with the highest return.
+          </p>
+        </div>
+      )}
+
+      <div className="rounded-lg border border-neutral-800 mb-4">
+        <button
+          onClick={() => setShowAdvanced((v) => !v)}
+          className="w-full flex items-center justify-between px-3.5 py-2.5 text-sm text-neutral-300 hover:bg-neutral-900/60 rounded-lg transition-colors"
+        >
+          <span>Advanced settings</span>
+          <span className="text-xs text-neutral-500">{showAdvanced ? "Hide" : "Show"}</span>
+        </button>
+        {showAdvanced && (
+          <div className="px-3.5 pb-3.5 grid grid-cols-2 sm:grid-cols-3 gap-3">
+            <div>
+              <label className="block text-xs text-neutral-500 mb-1">History window</label>
+              <select
+                value={histWindow}
+                disabled={running}
+                onChange={(e) => setHistWindow(e.target.value)}
+                className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300 disabled:opacity-60"
+              >
+                {HISTORY_WINDOW_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[13px] text-neutral-600 mt-0.5">Restricts the resampled history to the most recent stretch, if you don't want older, less relevant periods included.</p>
+            </div>
+            <div>
+              <label className="block text-xs text-neutral-500 mb-1">Risk-free rate (%)</label>
+              <input
+                type="number"
+                min="0"
+                max="20"
+                step="0.5"
+                value={riskFreePct}
+                disabled={running}
+                onChange={(e) => setRiskFreePct(e.target.value)}
+                className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300 disabled:opacity-60"
+              />
+              <p className="text-[13px] text-neutral-600 mt-0.5">Used as the baseline "safe" return for the risk ratios.</p>
+            </div>
+            <div>
+              <label className="block text-xs text-neutral-500 mb-1">Block length (months)</label>
+              <input
+                type="number"
+                min="1"
+                max="24"
+                step="1"
+                value={blockMonths}
+                disabled={running}
+                onChange={(e) => setBlockMonths(e.target.value)}
+                className="w-full text-sm bg-black border border-neutral-700 rounded-md px-2.5 py-2 text-neutral-100 font-mono focus:outline-none focus:border-neutral-300 focus:ring-1 focus:ring-neutral-300 disabled:opacity-60"
+              />
+              <p className="text-[13px] text-neutral-600 mt-0.5">
+                Consecutive real months resampled together — longer keeps more real momentum, shorter mixes more
+                combinations.
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={handleStart}
+          disabled={running}
+          className="flex items-center gap-1.5 text-sm bg-neutral-100 hover:bg-white disabled:opacity-60 text-black font-medium px-3.5 py-2 rounded-md transition-colors"
+        >
+          {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Shuffle className="w-4 h-4" />}
+          {status === "running"
+            ? "Searching..."
+            : status === "finishing"
+            ? "Checking finalists..."
+            : outcome
+            ? "Search again"
+            : "Start historical search"}
+        </button>
+        {status === "running" && (
+          <button
+            onClick={handleStop}
+            className="flex items-center gap-1.5 text-sm text-neutral-300 border border-neutral-700 hover:bg-neutral-800 px-3.5 py-2 rounded-md transition-colors"
+          >
+            <Square className="w-3.5 h-3.5" />
+            Stop and use best so far
+          </button>
+        )}
+      </div>
+
+      {running && live && (
+        <div className="mt-4 space-y-3 anim-in">
+          <div>
+            <div className="flex justify-between text-xs text-neutral-500 mb-1 font-mono">
+              <span>
+                {Math.min(live.elapsed || 0, live.total).toFixed(1)}s / {live.total}s
+              </span>
+              <span>{live.tested.toLocaleString("en-IN")} allocations tested</span>
+            </div>
+            <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-neutral-100"
+                style={{ width: `${Math.min(100, ((live.elapsed || 0) / live.total) * 100)}%` }}
+              />
+            </div>
+          </div>
+          {live.best && (
+            <div className="rounded-lg border border-neutral-800 px-3 py-2.5">
+              <p className="text-xs text-neutral-500 mb-1">Best so far</p>
+              <p className="text-sm text-neutral-200 font-mono">
+                {selected.map((p, i) => `${p.name} ${(live.best.w[i] * 100).toFixed(1)}%`).join(" · ")}
+              </p>
+              <p className="text-xs text-neutral-500 font-mono mt-1">
+                return {fmtPct(live.best.m.mean, 2)} · risk {fmtPct(live.best.m.vol, 2)} · return per risk{" "}
+                {live.best.m.sharpe.toFixed(2)}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {status === "done" && outcome && (
+        <div className="mt-5 space-y-5 anim-in">
+          <div className="rounded-lg border border-neutral-600 bg-white/5 px-3.5 py-2.5">
+            <p className="text-sm text-neutral-100">
+              {outcome.improved
+                ? "Found a better allocation than your current one, on the resampled real history."
+                : "Your current allocation was already the best of everything tested — no change recommended."}
+            </p>
+            <p className="text-xs text-neutral-500 mt-0.5">
+              {outcome.tested.toLocaleString("en-IN")} allocations tested in {outcome.seconds}s · goal:{" "}
+              {objectiveLabel?.toLowerCase()} · block {outcome.blockMonths}mo
+            </p>
+          </div>
+
+          <div>
+            <h3 className="text-xs font-semibold text-neutral-300 mb-2">Allocation</h3>
+            <div className="space-y-2">
+              {selected.map((p, i) => {
+                const curW = outcome.baseline.w[i];
+                const bestW = outcome.winner.w[i];
+                return (
+                  <div key={p.id}>
+                    <div className="flex justify-between gap-3 text-sm mb-1">
+                      <span className="flex items-center gap-2 min-w-0 text-neutral-200">
+                        <span
+                          className="h-2 w-2 rounded-full shrink-0"
+                          style={{ backgroundColor: SERIES_COLORS[i % SERIES_COLORS.length] }}
+                        />
+                        <span className="truncate">{p.name}</span>
+                      </span>
+                      <span className="text-neutral-400 font-mono text-xs whitespace-nowrap self-center">
+                        {fmtPct(curW, 1)} → <span className="text-neutral-100">{fmtPct(bestW, 1)}</span> · {fmtINR(bestW * amount)}
+                      </span>
+                    </div>
+                    <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden relative">
+                      <div className="absolute inset-y-0 left-0 rounded-full bg-neutral-600" style={{ width: `${curW * 100}%` }} />
+                      <div
+                        className="absolute inset-y-0 left-0 rounded-full"
+                        style={{ width: `${bestW * 100}%`, backgroundColor: SERIES_COLORS[i % SERIES_COLORS.length], opacity: 0.85 }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <p className="text-[13px] text-neutral-600 mt-1.5">Dark bar = current allocation, bright bar = best found.</p>
+          </div>
+
+          <div>
+            <h3 className="text-xs font-semibold text-neutral-300 mb-1">Current vs best (resampled real history, fresh draws)</h3>
+            <div className="overflow-x-auto rounded-lg border border-neutral-800">
+              <table className="w-full text-sm min-w-[340px]">
+                <thead>
+                  <tr className="text-left text-xs text-neutral-500 border-b border-neutral-800">
+                    <th className="px-3 py-2 font-medium" />
+                    <th className="px-3 py-2 font-medium">Current</th>
+                    <th className="px-3 py-2 font-medium">Best found</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {metricRows.map((row) => (
+                    <tr key={row.label} className="border-b border-neutral-800/60 last:border-0">
+                      <td className="px-3 py-2 text-neutral-400">{row.label}</td>
+                      <td className="px-3 py-2 font-mono text-neutral-300">{row.cur}</td>
+                      <td className="px-3 py-2 font-mono text-neutral-100">{row.best}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div>
+            <h3 className="text-xs font-semibold text-neutral-300 mb-1">Every allocation tested: risk vs return</h3>
+            <p className="text-xs text-neutral-500 mb-2">
+              Each dot is one random allocation scored on resampled real history. Up and to the left is better (more
+              return, less risk). Shown: a sample of {outcome.cloud.length.toLocaleString("en-IN")} of the{" "}
+              {outcome.tested.toLocaleString("en-IN")} tested.
+            </p>
+            <ResponsiveContainer width="100%" height={270}>
+              <ScatterChart margin={{ top: 8, right: 14, left: 0, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+                <XAxis
+                  type="number"
+                  dataKey="x"
+                  name="Risk"
+                  domain={["auto", "auto"]}
+                  tick={{ fontSize: 12, fill: "#a3a3a3" }}
+                  tickFormatter={(v) => `${Number(v).toFixed(1)}%`}
+                  height={46}
+                  label={{ value: "Risk (spread of outcomes)", position: "insideBottom", offset: -2, fill: "#a3a3a3", fontSize: 12 }}
+                />
+                <YAxis
+                  type="number"
+                  dataKey="y"
+                  name="Return"
+                  domain={["auto", "auto"]}
+                  tick={{ fontSize: 12, fill: "#a3a3a3" }}
+                  tickFormatter={(v) => `${Number(v).toFixed(1)}%`}
+                  width={52}
+                />
+                <ZAxis type="number" dataKey="z" domain={[0, 10]} range={[18, 200]} />
+                <Tooltip
+                  cursor={{ strokeDasharray: "3 3", stroke: "#525252" }}
+                  content={({ active, payload }) =>
+                    active && payload && payload.length ? (
+                      <div style={{ backgroundColor: "#0a0a0a", border: "1px solid #262626", borderRadius: 8, padding: "6px 10px", fontSize: 14, color: "#e5e5e5" }}>
+                        Risk {Number(payload[0].payload.x).toFixed(2)}% · Return {Number(payload[0].payload.y).toFixed(2)}%
+                      </div>
+                    ) : null
+                  }
+                />
+                <Legend verticalAlign="bottom" iconSize={9} wrapperStyle={{ fontSize: 13, color: "#a3a3a3" }} />
+                <Scatter name="Tested allocations" data={outcome.cloud.map((pt) => ({ ...pt, z: 0 }))} fill="#525252" fillOpacity={0.55} isAnimationActive={false} />
+                <Scatter name="Current" data={[{ ...outcome.searchBaseline, z: 6 }]} fill="#a3a3a3" shape="triangle" legendType="triangle" isAnimationActive={false} />
+                <Scatter name="Best found" data={[{ ...outcome.searchBest, z: 10 }]} fill="#fafafa" shape="square" legendType="square" isAnimationActive={false} />
+              </ScatterChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {outcome.improved && (
+              <button
+                onClick={() => {
+                  onApply(outcome.winner.w);
+                  setApplied(true);
+                }}
+                disabled={applied}
+                className="flex items-center gap-1.5 text-sm bg-neutral-100 hover:bg-white disabled:opacity-60 text-black font-medium px-3.5 py-2 rounded-md transition-colors"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                {applied ? "Allocation applied" : "Use this allocation"}
+              </button>
+            )}
+            {result.customized && (
+              <button
+                onClick={() => {
+                  onRestore();
+                  setApplied(false);
+                }}
+                className="flex items-center gap-1.5 text-sm text-neutral-300 border border-neutral-700 hover:bg-neutral-800 px-3.5 py-2 rounded-md transition-colors"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Restore optimizer allocation
+              </button>
+            )}
+          </div>
+
+          <div className="pt-2 border-t border-neutral-800">
+            <h3 className="text-xs font-semibold text-neutral-300 mb-1">What actually happened: real historical backtest</h3>
+            <p className="text-xs text-neutral-500 mb-2">
+              Not a simulation — this is what each fixed allocation would really have been worth, day by day, over{" "}
+              {isoToLabel(dataset.dates[0])} to {isoToLabel(dataset.dates[dataset.dates.length - 1])}, rebalanced on
+              your chosen schedule.
+            </p>
+            <ResponsiveContainer width="100%" height={240}>
+              <LineChart data={outcome.analysis.chart} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
+                <XAxis dataKey="date" tick={{ fontSize: 12, fill: "#a3a3a3" }} interval="preserveStartEnd" tickFormatter={isoToLabel} />
+                <YAxis tick={{ fontSize: 12, fill: "#a3a3a3" }} width={60} tickFormatter={fmtINRCompact} domain={["auto", "auto"]} />
+                <ReferenceLine y={amount} stroke="#525252" strokeDasharray="4 4" />
+                <Tooltip
+                  labelFormatter={isoToLabel}
+                  formatter={(v, name) => [fmtINR(v), name]}
+                  itemStyle={{ color: "#e5e5e5" }}
+                  labelStyle={{ color: "#e5e5e5", fontWeight: 600 }}
+                  contentStyle={TOOLTIP_STYLE}
+                />
+                <Legend wrapperStyle={{ fontSize: 13, color: "#a3a3a3" }} />
+                {selected.map((p, i) => (
+                  <Line
+                    key={`asset${i}`}
+                    dataKey={`asset${i}`}
+                    name={p.name}
+                    stroke={ASSET_LINE_COLORS[i % ASSET_LINE_COLORS.length]}
+                    strokeWidth={1.25}
+                    strokeOpacity={0.85}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                ))}
+                <Line dataKey="current" name="Current allocation" stroke="#a3a3a3" strokeWidth={1.5} strokeDasharray="5 3" dot={false} isAnimationActive={false} />
+                <Line dataKey="final" name="Recommended allocation" stroke="#fafafa" strokeWidth={2.5} dot={false} isAnimationActive={false} />
+              </LineChart>
+            </ResponsiveContainer>
+
+            <div className="overflow-x-auto rounded-lg border border-neutral-800 mt-3">
+              <table className="w-full text-sm min-w-[420px]">
+                <thead>
+                  <tr className="text-left text-xs text-neutral-500 border-b border-neutral-800">
+                    <th className="px-3 py-2 font-medium">Allocation</th>
+                    <th className="px-3 py-2 font-medium">CAGR</th>
+                    <th className="px-3 py-2 font-medium">Volatility</th>
+                    <th className="px-3 py-2 font-medium">Max drawdown</th>
+                    <th className="px-3 py-2 font-medium">Return per risk</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {outcome.analysis.rows.map((r) => (
+                    <tr key={r.key} className="border-b border-neutral-800/60 last:border-0">
+                      <td className="px-3 py-2 text-neutral-200">{r.label}</td>
+                      <td className="px-3 py-2 font-mono text-neutral-300">{fmtPct(r.cagr, 1)}</td>
+                      <td className="px-3 py-2 font-mono text-neutral-300">{fmtPct(r.vol, 1)}</td>
+                      <td className="px-3 py-2 font-mono text-neutral-400">{fmtPct(r.maxDrawdown, 1)}</td>
+                      <td className="px-3 py-2 font-mono text-neutral-100">{r.ratio.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <h4 className="text-xs font-semibold text-neutral-300 mt-4 mb-1">Consistency check: first half vs second half</h4>
+            <p className="text-[13px] text-neutral-600 mb-2">
+              Splits the same history in two at {isoToLabel(outcome.analysis.midDate)} and shows CAGR separately for
+              each half — a recommendation that only worked in one half is a warning sign, not a strength.
+            </p>
+            <div className="overflow-x-auto rounded-lg border border-neutral-800">
+              <table className="w-full text-sm min-w-[380px]">
+                <thead>
+                  <tr className="text-left text-xs text-neutral-500 border-b border-neutral-800">
+                    <th className="px-3 py-2 font-medium">Allocation</th>
+                    <th className="px-3 py-2 font-medium">First half CAGR</th>
+                    <th className="px-3 py-2 font-medium">Second half CAGR</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {outcome.analysis.halves.map((h) => (
+                    <tr key={h.key} className="border-b border-neutral-800/60 last:border-0">
+                      <td className="px-3 py-2 text-neutral-200">{h.label}</td>
+                      <td className="px-3 py-2 font-mono text-neutral-300">{fmtPct(h.first.cagr, 1)}</td>
+                      <td className="px-3 py-2 font-mono text-neutral-300">{fmtPct(h.second.cagr, 1)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <p className="text-xs text-neutral-600">
+            The search and the risk/return table above run on {outcome.paths.toLocaleString("en-IN")} resampled draws
+            during the search and {outcome.validationPaths.toLocaleString("en-IN")} fresh ones for the table — real
+            historical stretches, reshuffled, not a parametric guess. Even so, this is one real historical window (
+            {dataset.spanYears.toFixed(1)} years), not many independent alternate histories, and it reflects{" "}
+            {selected.length === dataset.n ? "this specific" : ""} data's own period — a different period, or the
+            future, can look very different. Past performance is not a guarantee of future results.
+          </p>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 
 function MetricCard({ icon, label, value, subValue, delay = 0 }) {
   return (
